@@ -1,0 +1,34 @@
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+credentials/
+secrets/
+
+# Rust build artifacts
+target/
+
+# Ladybug databases and extension caches
+*.lbdb
+.lbdb/
+
+# SQLite databases and local caches
+*.db
+*.sqlite
+*.sqlite3
+
+# Local assistant state
+run/
+cache/
+logs/
+
+# Personal memory, eventually kept in a separate repository
+memory/
+attachments/
+
+# Editor / OS
+.vscode/
+.idea/
+.direnv/
+.DS_Store
