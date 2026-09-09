@@ -1,0 +1,105 @@
+[entity_types]
+values = [
+  "person",
+  "project",
+  "topic",
+  "technology",
+  "software",
+  "hardware",
+  "organization",
+  "place",
+  "concept",
+  "other"
+]
+
+[memory_types]
+values = [
+  "fact",
+  "thought",
+  "idea",
+  "decision",
+  "measurement",
+  "event",
+  "state_update",
+  "preference",
+  "relationship",
+  "task_request",
+  "reminder_request",
+  "resource_description",
+  "conversation",
+  "note_chunk"
+]
+
+[memory_statuses]
+values = [
+  "active",
+  "redundant",
+  "superseded",
+  "discarded",
+  "suspended",
+  "trashed"
+]
+
+[task_statuses]
+values = [
+  "open",
+  "in_progress",
+  "completed",
+  "cancelled",
+  "expired",
+  "archived"
+]
+
+[reminder_statuses]
+values = [
+  "scheduled",
+  "triggered",
+  "completed",
+  "cancelled"
+]
+
+[embedding_statuses]
+values = [
+  "pending",
+  "ready",
+  "failed",
+  "obsolete"
+]
+
+[job_statuses]
+values = [
+  "queued",
+  "running",
+  "completed",
+  "failed",
+  "cancelled"
+]
+
+[relationships]
+values = [
+  "ABOUT",
+  "RELATED_TO",
+  "PART_OF",
+  "HAS_CANONICAL_NOTE",
+  "USES",
+  "RUNS_ON",
+  "WORKS_ON",
+  "CANDIDATE_FOR",
+  "RECORDED_IN",
+  "MEMORY_RELATED_TO",
+  "SUPERSEDES",
+  "HAS_STATE",
+  "STATE_EVOLVES_INTO",
+  "REPRESENTS_STATE",
+  "REPRESENTS_TASK",
+  "TASK_ABOUT",
+  "HAS_REMINDER",
+  "RESOURCE_RELATED_TO",
+  "RESOURCE_SUPPORTS",
+  "ATTACHED_TO",
+  "ATTACHMENT_RELATED_TO",
+  "ATTACHMENT_SUPPORTS",
+  "ATTACHMENT_REPRESENTS",
+  "PART_OF_CHUNK",
+  "HAS_EMBEDDING"
+]
