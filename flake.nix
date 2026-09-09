@@ -23,9 +23,6 @@
           cmake
           gcc
           git
-
-          # Ladybug CLI for development and database inspection.
-          ladybugdb
         ];
 
         shellHook = ''
