@@ -18,14 +18,15 @@ target/
 *.sqlite
 *.sqlite3
 
-# Local assistant state
+# Local assistant runtime state
+/assistant-data/
 run/
 cache/
 logs/
 
-# Personal memory, eventually kept in a separate repository
-memory/
-attachments/
+# Personal memory repositories, when stored alongside system repo
+/memory/
+/attachments/
 
 # Editor / OS
 .vscode/

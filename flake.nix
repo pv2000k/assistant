@@ -33,7 +33,6 @@
           echo "Cargo:   $(cargo --version)"
           echo "OpenSSL: $(pkg-config --modversion openssl)"
           echo "CMake:   $(cmake --version | head -n 1)"
-          echo "Ladybug: $(lbug --version)"
           echo
         '';
       };

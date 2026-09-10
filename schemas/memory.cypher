@@ -109,7 +109,9 @@ CREATE NODE TABLE IF NOT EXISTS Reminder (
 
     source_type STRING,
     source_id STRING,
-    source_path STRING
+    source_path STRING,
+    source_anchor STRING,
+    source_excerpt STRING
 );
 
 CREATE NODE TABLE IF NOT EXISTS Resource (
@@ -154,10 +156,8 @@ CREATE NODE TABLE IF NOT EXISTS Embedding (
     model_id STRING,
     dimensions INT32,
     vector FLOAT[],
-
     embedding_status STRING,
     error STRING,
-
     created_at TIMESTAMP,
     updated_at TIMESTAMP
 );
@@ -413,8 +413,20 @@ CREATE REL TABLE IF NOT EXISTS ATTACHMENT_REPRESENTS (
     status STRING
 );
 
-CREATE REL TABLE IF NOT EXISTS PART_OF_CHUNK (
+CREATE REL TABLE IF NOT EXISTS CHUNK_OF_NOTE (
     FROM Chunk TO Note,
+    created_at TIMESTAMP,
+    status STRING
+);
+
+CREATE REL TABLE IF NOT EXISTS CHUNK_OF_RESOURCE (
+    FROM Chunk TO Resource,
+    created_at TIMESTAMP,
+    status STRING
+);
+
+CREATE REL TABLE IF NOT EXISTS CHUNK_OF_ATTACHMENT (
+    FROM Chunk TO Attachment,
     created_at TIMESTAMP,
     status STRING
 );
