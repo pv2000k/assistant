@@ -8,7 +8,8 @@ use assistant_protocol::{
 use model_router::ModelRouter;
 use orchestrator::{
     ApprovalHandler, Controller, HybridMemory, IndexedToolExecutor, LlamaCppController, Memory,
-    MemoryIntentMode, MemoryQuery, Orchestrator, PersistentMemoryIndexer, ToolCall, UserRequest,
+    MemoryIntentMode, MemoryQuery, Orchestrator, PersistentMemoryIndexer, ToolCall, ToolExecutor,
+    UserRequest,
 };
 use sqlite_memory::SqliteMemoryDb;
 use std::{
@@ -414,6 +415,71 @@ impl RuntimeIpcHandler {
             Err(error) => WireResponse::error(id, "jobs_list_failed", error.to_string()),
         }
     }
+
+    fn handle_tasks_mutate(
+        &self,
+        id: u64,
+        operation: String,
+        item_id: Option<String>,
+        title: Option<String>,
+        body: Option<String>,
+        due: Option<Option<String>>,
+        status: Option<String>,
+    ) -> WireResponse {
+        // Direct IPC mutations are explicit client/user actions.
+        // Model-originated tasks.mutate calls remain approval-gated by the orchestrator.
+        let operation_for_response = operation.clone();
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(
+            "operation".to_string(),
+            serde_json::Value::String(operation.clone()),
+        );
+
+        if let Some(item_id) = item_id {
+            arguments.insert("id".to_string(), serde_json::Value::String(item_id));
+        }
+
+        if let Some(title) = title {
+            arguments.insert("title".to_string(), serde_json::Value::String(title));
+        }
+
+        if let Some(body) = body {
+            arguments.insert("body".to_string(), serde_json::Value::String(body));
+        }
+
+        if let Some(due) = due {
+            arguments.insert(
+                "due".to_string(),
+                due.map_or(serde_json::Value::Null, serde_json::Value::String),
+            );
+        }
+
+        if let Some(status) = status {
+            arguments.insert("status".to_string(), serde_json::Value::String(status));
+        }
+
+        let arguments = serde_json::Value::Object(arguments);
+
+        match self.with_orchestrator(|orchestrator| {
+            let result = orchestrator.tools.execute(&ToolCall {
+                tool: "tasks.mutate".to_string(),
+                arguments,
+            })?;
+
+            if !result.success {
+                return Err(format!("Task mutation tool failed: {}", result.output).into());
+            }
+
+            Ok(assistant_protocol::MutationResult {
+                tool: "tasks.mutate".to_string(),
+                operation: operation_for_response,
+                output: result.output,
+            })
+        }) {
+            Ok(result) => WireResponse::ok(id, ResponsePayload::Mutation(result)),
+            Err(error) => WireResponse::error(id, "task_mutation_failed", error.to_string()),
+        }
+    }
 }
 
 impl ipc::RequestHandler for RuntimeIpcHandler {
@@ -454,6 +520,14 @@ impl ipc::RequestHandler for RuntimeIpcHandler {
             }
             RequestMethod::MemoryProposals { limit } => self.handle_memory_proposals(id, limit),
             RequestMethod::JobsList { status, limit } => self.handle_jobs(id, status, limit),
+            RequestMethod::TasksMutate {
+                operation,
+                id: item_id,
+                title,
+                body,
+                due,
+                status,
+            } => self.handle_tasks_mutate(id, operation, item_id, title, body, due, status),
         }
     }
 }
@@ -857,7 +931,108 @@ enum ClientCommand {
     MemorySearch(String),
     MemoryProposals,
     Jobs(Option<String>),
+    TaskMutation {
+        operation: String,
+        id: Option<String>,
+        title: Option<String>,
+        body: Option<String>,
+        due: Option<Option<String>>,
+        status: Option<String>,
+    },
     Quit,
+}
+
+fn parse_task_mutation_command(text: &str) -> Result<ClientCommand, String> {
+    let remainder = text.strip_prefix(":task ").unwrap_or("").trim();
+    let mut parts = remainder.splitn(2, ' ');
+    let operation = parts.next().unwrap_or("");
+    let arguments = parts.next().unwrap_or("").trim();
+
+    match operation {
+        "create" => {
+            if arguments.is_empty() {
+                Err("Usage: :task create <title>".to_string())
+            } else {
+                Ok(ClientCommand::TaskMutation {
+                    operation: "create".to_string(),
+                    id: None,
+                    title: Some(arguments.to_string()),
+                    body: None,
+                    due: None,
+                    status: None,
+                })
+            }
+        }
+        "complete" | "cancel" => {
+            if arguments.is_empty() || arguments.contains(char::is_whitespace) {
+                Err(format!("Usage: :task {operation} <id>"))
+            } else {
+                Ok(ClientCommand::TaskMutation {
+                    operation: operation.to_string(),
+                    id: Some(arguments.to_string()),
+                    title: None,
+                    body: None,
+                    due: None,
+                    status: None,
+                })
+            }
+        }
+        "update" => {
+            let mut parts = arguments.splitn(2, ' ');
+            let id = parts.next().unwrap_or("").trim();
+            let assignment = parts.next().unwrap_or("").trim();
+            if id.is_empty() || assignment.is_empty() {
+                return Err("Usage: :task update <id> <field>=<value>".to_string());
+            }
+
+            let (field, value) = assignment
+                .split_once('=')
+                .ok_or_else(|| "Usage: :task update <id> <field>=<value>".to_string())?;
+            let field = field.trim().to_ascii_lowercase();
+            let value = value.trim();
+
+            match field.as_str() {
+                "title" => Ok(ClientCommand::TaskMutation {
+                    operation: "update".to_string(),
+                    id: Some(id.to_string()),
+                    title: Some(value.to_string()),
+                    body: None,
+                    due: None,
+                    status: None,
+                }),
+                "body" => Ok(ClientCommand::TaskMutation {
+                    operation: "update".to_string(),
+                    id: Some(id.to_string()),
+                    title: None,
+                    body: Some(value.to_string()),
+                    due: None,
+                    status: None,
+                }),
+                "due" => Ok(ClientCommand::TaskMutation {
+                    operation: "update".to_string(),
+                    id: Some(id.to_string()),
+                    title: None,
+                    body: None,
+                    due: Some(if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    }),
+                    status: None,
+                }),
+                "status" => Ok(ClientCommand::TaskMutation {
+                    operation: "update".to_string(),
+                    id: Some(id.to_string()),
+                    title: None,
+                    body: None,
+                    due: None,
+                    status: Some(value.to_string()),
+                }),
+                _ => Err("Task update fields: title, body, due, status".to_string()),
+            }
+        }
+        _ => Err("Task operations: create, update, complete, cancel".to_string()),
+    }
 }
 
 fn parse_client_command(text: &str) -> Result<ClientCommand, String> {
@@ -873,6 +1048,8 @@ fn parse_client_command(text: &str) -> Result<ClientCommand, String> {
         ":reminders" => Ok(ClientCommand::Reminders(None)),
         ":memory-proposals" => Ok(ClientCommand::MemoryProposals),
         ":jobs" => Ok(ClientCommand::Jobs(None)),
+        ":task" => Err("Usage: :task [create|update|complete|cancel] ...".to_string()),
+        _ if text.starts_with(":task ") => parse_task_mutation_command(text),
         _ if text.starts_with(":chat ") => {
             let message = text.strip_prefix(":chat ").unwrap_or("").trim();
             if message.is_empty() {
@@ -1047,6 +1224,10 @@ fn print_client_response(response: ResponsePayload) {
             }
             println!();
         }
+        ResponsePayload::Mutation(mutation) => {
+            println!("{} {} succeeded:", mutation.tool, mutation.operation);
+            println!("{}", mutation.output);
+        }
     }
 }
 
@@ -1059,7 +1240,7 @@ fn run_client_mode() -> Result<(), Box<dyn Error>> {
     println!("============================================================");
     println!("Runtime socket: {}", socket_path.display());
     println!(
-        "Commands: plain text or :chat <text>, :ping, :health, :model [list|status|use <id>], :quit"
+        "Commands: plain text or :chat <text>, :ping, :health, :model [list|status|use <id>], :tasks [status], :reminders [status], :memory search <query>, :memory-proposals, :jobs [status], :task [create|update|complete|cancel] ..., :quit"
     );
     println!("============================================================");
     println!();
@@ -1114,6 +1295,21 @@ fn run_client_mode() -> Result<(), Box<dyn Error>> {
             ClientCommand::Jobs(status) => RequestMethod::JobsList {
                 status,
                 limit: None,
+            },
+            ClientCommand::TaskMutation {
+                operation,
+                id,
+                title,
+                body,
+                due,
+                status,
+            } => RequestMethod::TasksMutate {
+                operation,
+                id,
+                title,
+                body,
+                due,
+                status,
             },
             ClientCommand::Quit => unreachable!(),
         };
@@ -1809,6 +2005,54 @@ mod session_tests {
         assert_eq!(
             parse_client_command(":jobs failed"),
             Ok(ClientCommand::Jobs(Some("failed".to_string())))
+        );
+    }
+
+    #[test]
+    fn client_command_parser_accepts_task_mutation_commands() {
+        assert_eq!(
+            parse_client_command(":task create Review RCM report"),
+            Ok(ClientCommand::TaskMutation {
+                operation: "create".to_string(),
+                id: None,
+                title: Some("Review RCM report".to_string()),
+                body: None,
+                due: None,
+                status: None,
+            })
+        );
+        assert_eq!(
+            parse_client_command(":task complete task:review-rcm"),
+            Ok(ClientCommand::TaskMutation {
+                operation: "complete".to_string(),
+                id: Some("task:review-rcm".to_string()),
+                title: None,
+                body: None,
+                due: None,
+                status: None,
+            })
+        );
+        assert_eq!(
+            parse_client_command(":task update task:review-rcm title=Updated title"),
+            Ok(ClientCommand::TaskMutation {
+                operation: "update".to_string(),
+                id: Some("task:review-rcm".to_string()),
+                title: Some("Updated title".to_string()),
+                body: None,
+                due: None,
+                status: None,
+            })
+        );
+        assert_eq!(
+            parse_client_command(":task update task:review-rcm due="),
+            Ok(ClientCommand::TaskMutation {
+                operation: "update".to_string(),
+                id: Some("task:review-rcm".to_string()),
+                title: None,
+                body: None,
+                due: Some(None),
+                status: None,
+            })
         );
     }
 

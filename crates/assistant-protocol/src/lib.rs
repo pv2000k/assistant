@@ -70,6 +70,19 @@ pub enum RequestMethod {
         #[serde(default)]
         limit: Option<usize>,
     },
+    TasksMutate {
+        operation: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        due: Option<Option<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
 }
 
 impl RequestMethod {
@@ -132,6 +145,7 @@ pub enum ResponsePayload {
     Memory(MemorySearchResult),
     Proposals(MemoryProposalList),
     Jobs(JobList),
+    Mutation(MutationResult),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,6 +248,13 @@ pub struct JobSummary {
     pub next_run_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MutationResult {
+    pub tool: String,
+    pub operation: String,
+    pub output: serde_json::Value,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +299,82 @@ mod tests {
             })
         );
         assert!(decoded.result.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn task_mutation_omits_unset_optional_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let request = WireRequest::new(
+            13,
+            RequestMethod::TasksMutate {
+                operation: "complete".to_string(),
+                id: Some("task:rcm-report".to_string()),
+                title: None,
+                body: None,
+                due: None,
+                status: None,
+            },
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&request.encode_line()?)?;
+        assert_eq!(
+            value["method"]["method"],
+            serde_json::Value::String("tasks_mutate".to_string())
+        );
+        assert_eq!(
+            value["method"]["params"],
+            serde_json::json!({
+                "operation": "complete",
+                "id": "task:rcm-report"
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_mutation_preserves_explicit_null_due() -> Result<(), Box<dyn std::error::Error>> {
+        let request = WireRequest::new(
+            14,
+            RequestMethod::TasksMutate {
+                operation: "update".to_string(),
+                id: Some("task:rcm-report".to_string()),
+                title: None,
+                body: None,
+                due: Some(None),
+                status: None,
+            },
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&request.encode_line()?)?;
+        assert_eq!(
+            value["method"]["params"],
+            serde_json::json!({
+                "operation": "update",
+                "id": "task:rcm-report",
+                "due": null
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_mutation_request_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let request = WireRequest::new(
+            12,
+            RequestMethod::TasksMutate {
+                operation: "update".to_string(),
+                id: Some("task:rcm-report".to_string()),
+                title: Some("Review RCM report".to_string()),
+                body: None,
+                due: Some(Some("tomorrow at 6 PM".to_string())),
+                status: Some("in_progress".to_string()),
+            },
+        );
+
+        let encoded = request.encode_line()?;
+        let decoded = WireRequest::decode_line(&encoded)?;
+
+        assert_eq!(decoded, request);
         Ok(())
     }
 }
