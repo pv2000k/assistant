@@ -20,14 +20,9 @@ values = [
   "decision",
   "measurement",
   "event",
-  "state_update",
   "preference",
   "relationship",
-  "task_request",
-  "reminder_request",
-  "resource_description",
-  "conversation",
-  "note_chunk"
+  "conversation_derived"
 ]
 
 [memory_statuses]

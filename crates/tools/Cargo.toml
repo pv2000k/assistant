@@ -1,0 +1,17 @@
+[package]
+name = "tools"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
+indexer = { path = "../indexer" }
+sqlite-memory = { path = "../sqlite-memory" }
+time = { version = "0.3", features = ["formatting", "local-offset", "parsing"] }
+
+tempfile = "3"

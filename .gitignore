@@ -9,7 +9,6 @@ secrets/
 # Rust build artifacts
 target/
 
-# Ladybug databases and extension caches
 *.lbdb
 .lbdb/
 
