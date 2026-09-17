@@ -1,13 +1,13 @@
 mod ipc;
 
 use assistant_protocol::{
-    HealthStatus, ModelInfo, ModelList, ModelState, RequestMethod, ResponsePayload, WireRequest,
-    WireResponse,
+    ChatResponse, HealthStatus, ModelInfo, ModelList, ModelState, RequestMethod, ResponsePayload,
+    WireRequest, WireResponse,
 };
 use model_router::ModelRouter;
 use orchestrator::{
     ApprovalHandler, Controller, HybridMemory, IndexedToolExecutor, LlamaCppController,
-    Orchestrator, PersistentMemoryIndexer, ToolCall,
+    Orchestrator, PersistentMemoryIndexer, ToolCall, UserRequest,
 };
 use sqlite_memory::SqliteMemoryDb;
 use std::{
@@ -16,7 +16,7 @@ use std::{
     error::Error,
     io::{self, Write},
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
@@ -269,8 +269,39 @@ impl ModelControllerState for ModelSession {
     }
 }
 
+type RuntimeOrchestrator =
+    Orchestrator<SessionController<ModelSession>, HybridMemory, IndexedToolExecutor, ModelRouter>;
+
 struct RuntimeIpcHandler {
     model_session: ModelSession,
+    orchestrator: Arc<Mutex<RuntimeOrchestrator>>,
+}
+
+impl RuntimeIpcHandler {
+    fn handle_chat(&self, id: u64, text: String) -> WireResponse {
+        let request = UserRequest { text };
+        let orchestrator = match self.orchestrator.lock() {
+            Ok(orchestrator) => orchestrator,
+            Err(_) => {
+                return WireResponse::error(
+                    id,
+                    "chat_unavailable",
+                    "Runtime chat state lock was poisoned.",
+                );
+            }
+        };
+
+        match orchestrator.run(request.clone()) {
+            Ok(response) => {
+                if let Err(error) = orchestrator.controller.record_response(&request, &response) {
+                    return WireResponse::error(id, "chat_record_failed", error.to_string());
+                }
+
+                WireResponse::ok(id, ResponsePayload::Chat(ChatResponse { text: response }))
+            }
+            Err(error) => WireResponse::error(id, "chat_failed", error.to_string()),
+        }
+    }
 }
 
 impl ipc::RequestHandler for RuntimeIpcHandler {
@@ -286,6 +317,7 @@ impl ipc::RequestHandler for RuntimeIpcHandler {
                     ready: true,
                 }),
             ),
+            RequestMethod::Chat { text } => self.handle_chat(id, text),
             RequestMethod::ModelList => match self.model_session.list_models() {
                 Ok(models) => WireResponse::ok(id, ResponsePayload::Models(ModelList { models })),
                 Err(error) => WireResponse::error(id, "model_list_failed", error.to_string()),
@@ -653,6 +685,7 @@ fn parse_model_switch_command(text: &str) -> Option<String> {
 
 #[derive(Debug, PartialEq, Eq)]
 enum ClientCommand {
+    Chat(String),
     Ping,
     Health,
     ModelList,
@@ -669,6 +702,15 @@ fn parse_client_command(text: &str) -> Result<ClientCommand, String> {
         ":health" => Ok(ClientCommand::Health),
         ":model" | ":model list" => Ok(ClientCommand::ModelList),
         ":model status" => Ok(ClientCommand::ModelStatus),
+        ":chat" => Err("Usage: :chat <text>".to_string()),
+        _ if text.starts_with(":chat ") => {
+            let message = text.strip_prefix(":chat ").unwrap_or("").trim();
+            if message.is_empty() {
+                Err("Usage: :chat <text>".to_string())
+            } else {
+                Ok(ClientCommand::Chat(message.to_string()))
+            }
+        }
         _ if text.starts_with(":model use ") => {
             let model = text.strip_prefix(":model use ").unwrap_or("").trim();
             if model.is_empty() {
@@ -677,8 +719,9 @@ fn parse_client_command(text: &str) -> Result<ClientCommand, String> {
                 Ok(ClientCommand::ModelSwitch(model.to_ascii_lowercase()))
             }
         }
+        _ if !text.starts_with(':') => Ok(ClientCommand::Chat(text.to_string())),
         _ => Err(
-            "Client mode commands: :ping, :health, :model [list|status|use <id>], :quit"
+            "Client mode commands: :chat <text>, :ping, :health, :model [list|status|use <id>], :quit"
                 .to_string(),
         ),
     }
@@ -687,6 +730,11 @@ fn parse_client_command(text: &str) -> Result<ClientCommand, String> {
 fn print_client_response(response: ResponsePayload) {
     match response {
         ResponsePayload::Pong => println!("Pong."),
+        ResponsePayload::Chat(chat) => {
+            println!();
+            println!("{}", chat.text);
+            println!();
+        }
         ResponsePayload::Health(status) => {
             println!("Runtime: {} | ready={}", status.runtime, status.ready);
         }
@@ -733,7 +781,9 @@ fn run_client_mode() -> Result<(), Box<dyn Error>> {
     println!("PERSONAL ASSISTANT CLIENT");
     println!("============================================================");
     println!("Runtime socket: {}", socket_path.display());
-    println!("Commands: :ping, :health, :model [list|status|use <id>], :quit");
+    println!(
+        "Commands: plain text or :chat <text>, :ping, :health, :model [list|status|use <id>], :quit"
+    );
     println!("============================================================");
     println!();
 
@@ -766,6 +816,7 @@ fn run_client_mode() -> Result<(), Box<dyn Error>> {
         }
 
         let method = match command {
+            ClientCommand::Chat(text) => RequestMethod::Chat { text },
             ClientCommand::Ping => RequestMethod::Ping,
             ClientCommand::Health => RequestMethod::Health,
             ClientCommand::ModelList => RequestMethod::ModelList,
@@ -1008,12 +1059,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         None
     };
 
+    let approvals: Box<dyn ApprovalHandler> = if daemon_mode {
+        Box::new(orchestrator::DenyAllApproval)
+    } else {
+        Box::new(InteractiveApproval)
+    };
+
     let mut orchestrator = Orchestrator {
         controller,
         memory,
         tools: tool_executor,
         models,
-        approvals: Box::new(InteractiveApproval),
+        approvals,
     };
 
     println!();
@@ -1026,6 +1083,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if daemon_mode {
         let handler = Arc::new(RuntimeIpcHandler {
             model_session: model_session.clone(),
+            orchestrator: Arc::new(Mutex::new(orchestrator)),
         });
         let socket_path = ipc::default_socket_path()?;
         ipc::serve(&socket_path, handler)
@@ -1420,9 +1478,22 @@ mod session_tests {
     }
 
     #[test]
+    fn client_command_parser_accepts_chat_text() {
+        assert_eq!(
+            parse_client_command("hello"),
+            Ok(ClientCommand::Chat("hello".to_string()))
+        );
+        assert_eq!(
+            parse_client_command(":chat hello"),
+            Ok(ClientCommand::Chat("hello".to_string()))
+        );
+        assert!(parse_client_command(":chat").is_err());
+    }
+
+    #[test]
     fn client_command_parser_rejects_unrecognized_input() {
-        assert!(parse_client_command("hello").is_err());
         assert!(parse_client_command(":model switch qwen").is_err());
+        assert!(parse_client_command(":unknown").is_err());
     }
 
     #[test]

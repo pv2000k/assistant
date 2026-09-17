@@ -41,7 +41,7 @@ pub struct ToolResult {
     pub output: Value,
 }
 
-pub trait Tool {
+pub trait Tool: Send {
     fn definition(&self) -> ToolDefinition;
 
     fn execute(&self, arguments: &Value) -> Result<ToolResult>;

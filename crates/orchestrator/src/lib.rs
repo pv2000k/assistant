@@ -295,7 +295,7 @@ pub trait ModelExecutor {
     }
 }
 
-pub trait ApprovalHandler {
+pub trait ApprovalHandler: Send + Sync {
     fn approve(&self, call: &ToolCall) -> Result<bool, Box<dyn std::error::Error>>;
 }
 
