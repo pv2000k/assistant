@@ -651,8 +651,151 @@ fn parse_model_switch_command(text: &str) -> Option<String> {
     None
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ClientCommand {
+    Ping,
+    Health,
+    ModelList,
+    ModelStatus,
+    ModelSwitch(String),
+    Quit,
+}
+
+fn parse_client_command(text: &str) -> Result<ClientCommand, String> {
+    let text = text.trim();
+    match text {
+        ":quit" | ":exit" => Ok(ClientCommand::Quit),
+        ":ping" => Ok(ClientCommand::Ping),
+        ":health" => Ok(ClientCommand::Health),
+        ":model" | ":model list" => Ok(ClientCommand::ModelList),
+        ":model status" => Ok(ClientCommand::ModelStatus),
+        _ if text.starts_with(":model use ") => {
+            let model = text.strip_prefix(":model use ").unwrap_or("").trim();
+            if model.is_empty() {
+                Err("Usage: :model use <id>".to_string())
+            } else {
+                Ok(ClientCommand::ModelSwitch(model.to_ascii_lowercase()))
+            }
+        }
+        _ => Err(
+            "Client mode commands: :ping, :health, :model [list|status|use <id>], :quit"
+                .to_string(),
+        ),
+    }
+}
+
+fn print_client_response(response: ResponsePayload) {
+    match response {
+        ResponsePayload::Pong => println!("Pong."),
+        ResponsePayload::Health(status) => {
+            println!("Runtime: {} | ready={}", status.runtime, status.ready);
+        }
+        ResponsePayload::Models(model_list) => {
+            println!();
+            for model in model_list.models {
+                let state = if model.active {
+                    "active"
+                } else if model.available {
+                    "available"
+                } else {
+                    "unavailable"
+                };
+                println!(
+                    "{} | {} | {}{}",
+                    model.id,
+                    state,
+                    model.display_name,
+                    if model.capabilities.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" | {}", model.capabilities.join(","))
+                    }
+                );
+            }
+            println!();
+        }
+        ResponsePayload::ModelStatus(status) => {
+            println!(
+                "Active controller model: {} | ready={}",
+                status.active_model.as_deref().unwrap_or("none"),
+                status.ready
+            );
+        }
+        other => println!("Unexpected client response: {other:?}"),
+    }
+}
+
+fn run_client_mode() -> Result<(), Box<dyn Error>> {
+    let socket_path = ipc::default_socket_path()?;
+    let client = assistant_client::IpcClient::new(&socket_path);
+
+    println!("============================================================");
+    println!("PERSONAL ASSISTANT CLIENT");
+    println!("============================================================");
+    println!("Runtime socket: {}", socket_path.display());
+    println!("Commands: :ping, :health, :model [list|status|use <id>], :quit");
+    println!("============================================================");
+    println!();
+
+    loop {
+        print!("assistant-client> ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        let bytes = io::stdin().read_line(&mut input)?;
+        if bytes == 0 {
+            println!();
+            break;
+        }
+
+        let text = input.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        let command = match parse_client_command(text) {
+            Ok(command) => command,
+            Err(error) => {
+                eprintln!("{error}");
+                continue;
+            }
+        };
+
+        if command == ClientCommand::Quit {
+            break;
+        }
+
+        let method = match command {
+            ClientCommand::Ping => RequestMethod::Ping,
+            ClientCommand::Health => RequestMethod::Health,
+            ClientCommand::ModelList => RequestMethod::ModelList,
+            ClientCommand::ModelStatus => RequestMethod::ModelStatus,
+            ClientCommand::ModelSwitch(model) => RequestMethod::ModelSwitch { model },
+            ClientCommand::Quit => unreachable!(),
+        };
+
+        match client.request(method) {
+            Ok(response) => print_client_response(response),
+            Err(error) => eprintln!("Client request failed: {error}"),
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
-    let daemon_mode = env::args().skip(1).any(|argument| argument == "--daemon");
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    let daemon_mode = arguments.iter().any(|argument| argument == "--daemon");
+    let client_mode = arguments.iter().any(|argument| argument == "--client");
+
+    if daemon_mode && client_mode {
+        return Err("--daemon and --client cannot be used together.".into());
+    }
+
+    if client_mode {
+        return run_client_mode();
+    }
+
     let memory_root = memory_root()?;
 
     std::fs::create_dir_all(&memory_root)?;
@@ -1258,6 +1401,28 @@ mod session_tests {
             created_at: None,
             updated_at: None,
         }
+    }
+
+    #[test]
+    fn client_command_parser_handles_runtime_commands() {
+        assert_eq!(parse_client_command(":ping"), Ok(ClientCommand::Ping));
+        assert_eq!(parse_client_command(":health"), Ok(ClientCommand::Health));
+        assert_eq!(parse_client_command(":model"), Ok(ClientCommand::ModelList));
+        assert_eq!(
+            parse_client_command(":model status"),
+            Ok(ClientCommand::ModelStatus)
+        );
+        assert_eq!(
+            parse_client_command(":model use Qwen"),
+            Ok(ClientCommand::ModelSwitch("qwen".to_string()))
+        );
+        assert_eq!(parse_client_command(":exit"), Ok(ClientCommand::Quit));
+    }
+
+    #[test]
+    fn client_command_parser_rejects_unrecognized_input() {
+        assert!(parse_client_command("hello").is_err());
+        assert!(parse_client_command(":model switch qwen").is_err());
     }
 
     #[test]

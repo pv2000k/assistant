@@ -1479,6 +1479,7 @@ dependencies = [
 name = "runtime"
 version = "0.1.0"
 dependencies = [
+ "assistant-client",
  "assistant-protocol",
  "model-router",
  "orchestrator",

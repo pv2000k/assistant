@@ -8,6 +8,7 @@ name = "assistant"
 path = "src/main.rs"
 
 [dependencies]
+assistant-client = { path = "../assistant-client" }
 assistant-protocol = { path = "../assistant-protocol" }
 model-router = { path = "../model-router" }
 orchestrator = { path = "../orchestrator" }
