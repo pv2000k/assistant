@@ -1470,6 +1470,7 @@ dependencies = [
 name = "runtime"
 version = "0.1.0"
 dependencies = [
+ "assistant-protocol",
  "model-router",
  "orchestrator",
  "serde_json",
