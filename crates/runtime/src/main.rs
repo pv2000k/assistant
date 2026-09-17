@@ -17,9 +17,12 @@ use std::{
     io::{self, Write},
     path::PathBuf,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 const MAX_SESSION_TURNS: usize = 8;
+const MODEL_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_HISTORY_CHARS: usize = 5000;
 const MAX_HISTORY_TURN_CHARS: usize = 1200;
 
@@ -157,6 +160,15 @@ impl ModelSession {
             format!("Unknown local model '{normalized}'. Use :model list to see registered models.")
         })?;
 
+        let available = self.probe_model(definition)?;
+        if !available {
+            return Err(format!(
+                "Local model '{}' is unavailable at {}.",
+                definition.display_name, definition.base_url
+            )
+            .into());
+        }
+
         let mut active = self
             .active_model
             .write()
@@ -164,7 +176,36 @@ impl ModelSession {
         *active = definition.id.clone();
         drop(active);
 
-        self.model_info(&definition.id)
+        self.model_info_with_availability(definition, available)
+    }
+
+    fn probe_model(&self, definition: &LocalModelDefinition) -> Result<bool, Box<dyn Error>> {
+        let endpoint = format!("{}/v1/models", definition.base_url.trim_end_matches('/'));
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(MODEL_PROBE_CONNECT_TIMEOUT)
+            .timeout(MODEL_PROBE_TIMEOUT)
+            .build()?;
+
+        match client.get(endpoint).send() {
+            Ok(response) => Ok(response.status().is_success()),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn model_info_with_availability(
+        &self,
+        definition: &LocalModelDefinition,
+        available: bool,
+    ) -> Result<ModelInfo, Box<dyn Error>> {
+        let active = self.active_model_id()?;
+
+        Ok(ModelInfo {
+            id: definition.id.clone(),
+            display_name: definition.display_name.clone(),
+            available,
+            active: active == definition.id,
+            capabilities: definition.capabilities.clone(),
+        })
     }
 
     fn model_info(&self, id: &str) -> Result<ModelInfo, Box<dyn Error>> {
@@ -172,15 +213,8 @@ impl ModelSession {
             .models
             .get(id)
             .ok_or_else(|| format!("Unknown local model '{id}'."))?;
-        let active = self.active_model_id()?;
-
-        Ok(ModelInfo {
-            id: definition.id.clone(),
-            display_name: definition.display_name.clone(),
-            available: true,
-            active: active == definition.id,
-            capabilities: definition.capabilities.clone(),
-        })
+        let available = self.probe_model(definition)?;
+        Ok(self.model_info_with_availability(definition, available)?)
     }
 
     fn list_models(&self) -> Result<Vec<ModelInfo>, Box<dyn Error>> {
@@ -190,9 +224,16 @@ impl ModelSession {
     }
 
     fn status(&self) -> Result<ModelState, Box<dyn Error>> {
+        let active_model = self.active_model_id()?;
+        let definition = self
+            .models
+            .get(&active_model)
+            .ok_or_else(|| format!("Active model '{active_model}' is not registered."))?;
+        let ready = self.probe_model(definition)?;
+
         Ok(ModelState {
-            active_model: Some(self.active_model_id()?),
-            ready: true,
+            active_model: Some(active_model),
+            ready,
         })
     }
 }
@@ -1154,6 +1195,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+    use std::{io::Read, net::TcpListener, thread};
 
     struct FakeController {
         contexts: std::sync::Mutex<Vec<orchestrator::ControllerContext>>,
@@ -1492,15 +1534,45 @@ mod session_tests {
         assert_eq!(parse_model_switch_command(":model use qwen"), None);
     }
 
+    fn spawn_ok_model_server() -> Result<(String, thread::JoinHandle<()>), Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let body = r#"{"object":"list","data":[]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+
+        Ok((format!("http://{address}"), handle))
+    }
+
+    fn unavailable_model_url() -> Result<String, Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        drop(listener);
+        Ok(format!("http://{address}"))
+    }
+
     #[test]
-    fn model_session_switches_between_registered_models() -> Result<(), Box<dyn Error>> {
+    fn model_list_reports_backend_availability() -> Result<(), Box<dyn Error>> {
+        let (available_url, server) = spawn_ok_model_server()?;
+        let unavailable_url = unavailable_model_url()?;
+
         let mut models = HashMap::new();
         models.insert(
             "qwen".to_string(),
             LocalModelDefinition {
                 id: "qwen".to_string(),
                 display_name: "Qwen3.5 4B".to_string(),
-                base_url: "http://127.0.0.1:8080".to_string(),
+                base_url: unavailable_url,
                 model: "qwen.gguf".to_string(),
                 capabilities: vec!["controller".to_string()],
             },
@@ -1510,7 +1582,7 @@ mod session_tests {
             LocalModelDefinition {
                 id: "gemma".to_string(),
                 display_name: "Gemma 4 E4B".to_string(),
-                base_url: "http://127.0.0.1:8082".to_string(),
+                base_url: available_url,
                 model: "gemma.gguf".to_string(),
                 capabilities: vec!["controller".to_string()],
             },
@@ -1521,12 +1593,66 @@ mod session_tests {
             active_model: Arc::new(RwLock::new("qwen".to_string())),
         };
 
-        assert_eq!(session.active_model_id()?, "qwen");
+        let models = session.list_models()?;
+        let gemma = models.iter().find(|model| model.id == "gemma").unwrap();
+        let qwen = models.iter().find(|model| model.id == "qwen").unwrap();
+
+        assert!(gemma.available);
+        assert!(!qwen.available);
+        assert!(qwen.active);
+        assert!(!gemma.active);
+
+        server
+            .join()
+            .map_err(|_| "Model probe test server panicked.")?;
+        Ok(())
+    }
+
+    #[test]
+    fn model_session_switch_rejects_unavailable_models() -> Result<(), Box<dyn Error>> {
+        let (available_url, server) = spawn_ok_model_server()?;
+        let unavailable_url = unavailable_model_url()?;
+
+        let mut models = HashMap::new();
+        models.insert(
+            "qwen".to_string(),
+            LocalModelDefinition {
+                id: "qwen".to_string(),
+                display_name: "Qwen3.5 4B".to_string(),
+                base_url: unavailable_url.clone(),
+                model: "qwen.gguf".to_string(),
+                capabilities: vec!["controller".to_string()],
+            },
+        );
+        models.insert(
+            "gemma".to_string(),
+            LocalModelDefinition {
+                id: "gemma".to_string(),
+                display_name: "Gemma 4 E4B".to_string(),
+                base_url: available_url,
+                model: "gemma.gguf".to_string(),
+                capabilities: vec!["controller".to_string()],
+            },
+        );
+
+        let session = ModelSession {
+            models: Arc::new(models),
+            active_model: Arc::new(RwLock::new("qwen".to_string())),
+        };
+
         let selected = session.switch_model("gemma")?;
         assert_eq!(selected.id, "gemma");
+        assert!(selected.available);
         assert!(selected.active);
         assert_eq!(session.active_model_id()?, "gemma");
 
+        let error = session.switch_model("qwen").unwrap_err();
+        assert!(error.to_string().contains("unavailable"));
+        assert_eq!(session.active_model_id()?, "gemma");
+
+        server
+            .join()
+            .map_err(|_| "Model probe test server panicked.")?;
         Ok(())
     }
 }
