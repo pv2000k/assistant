@@ -1,0 +1,18 @@
+[package]
+name = "sqlite-ingest"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+indexer = { path = "../indexer" }
+sqlite-memory = { path = "../sqlite-memory" }
+embedding = { path = "../embedding" }
+model-router = { path = "../model-router" }
+orchestrator = { path = "../orchestrator" }
+tools = { path = "../tools" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+
+[dev-dependencies]
+tempfile = "3"

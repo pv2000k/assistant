@@ -1,0 +1,22 @@
+[package]
+name = "runtime"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "assistant"
+path = "src/main.rs"
+
+[dependencies]
+assistant-client = { path = "../assistant-client" }
+assistant-protocol = { path = "../assistant-protocol" }
+model-router = { path = "../model-router" }
+orchestrator = { path = "../orchestrator" }
+sqlite-memory = { path = "../sqlite-memory" }
+tools = { path = "../tools" }
+sqlite-ingest = { path = "../sqlite-ingest" }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

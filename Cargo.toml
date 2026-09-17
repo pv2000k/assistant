@@ -1,5 +1,17 @@
 [workspace]
 resolver = "3"
+
 members = [
-    "crates/memory",
+    "crates/indexer",
+
+    "crates/sqlite-memory",
+    "crates/sqlite-ingest",
+    "crates/orchestrator",
+    "crates/embedding",
+    "crates/tools",
+    "crates/model-router",
+    "crates/runtime",
+    "crates/tui",
+    "crates/assistant-protocol",
+    "crates/assistant-client",
 ]
