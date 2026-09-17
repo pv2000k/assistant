@@ -1,3 +1,9 @@
+mod ipc;
+
+use assistant_protocol::{
+    HealthStatus, ModelInfo, ModelList, ModelState, RequestMethod, ResponsePayload, WireRequest,
+    WireResponse,
+};
 use model_router::ModelRouter;
 use orchestrator::{
     ApprovalHandler, Controller, HybridMemory, IndexedToolExecutor, LlamaCppController,
@@ -5,15 +11,304 @@ use orchestrator::{
 };
 use sqlite_memory::SqliteMemoryDb;
 use std::{
+    collections::HashMap,
     env,
     error::Error,
     io::{self, Write},
     path::PathBuf,
+    sync::{Arc, RwLock},
+    time::Duration,
 };
 
 const MAX_SESSION_TURNS: usize = 8;
+const MODEL_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_HISTORY_CHARS: usize = 5000;
 const MAX_HISTORY_TURN_CHARS: usize = 1200;
+
+#[derive(Debug, Clone)]
+struct LocalModelDefinition {
+    id: String,
+    display_name: String,
+    base_url: String,
+    model: String,
+    capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ModelSession {
+    models: Arc<HashMap<String, LocalModelDefinition>>,
+    active_model: Arc<RwLock<String>>,
+}
+
+impl ModelSession {
+    fn from_environment(qwen_url: &str, qwen_model: &str) -> Result<Self, Box<dyn Error>> {
+        let mut models = HashMap::new();
+        models.insert(
+            "qwen".to_string(),
+            LocalModelDefinition {
+                id: "qwen".to_string(),
+                display_name: "Qwen3.5 4B".to_string(),
+                base_url: qwen_url.to_string(),
+                model: qwen_model.to_string(),
+                capabilities: vec!["controller".to_string(), "general_response".to_string()],
+            },
+        );
+
+        if let Ok(raw) = env::var("ASSISTANT_LOCAL_MODELS") {
+            let configured = serde_json::from_str::<Vec<serde_json::Value>>(&raw)
+                .map_err(|error| format!("ASSISTANT_LOCAL_MODELS is invalid JSON: {error}"))?;
+
+            for item in configured {
+                let id = item
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .ok_or("ASSISTANT_LOCAL_MODELS entries require a string id.")?
+                    .trim()
+                    .to_ascii_lowercase();
+                let display_name = item
+                    .get("display_name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(&id)
+                    .trim()
+                    .to_string();
+                let base_url = item
+                    .get("url")
+                    .and_then(|value| value.as_str())
+                    .ok_or("ASSISTANT_LOCAL_MODELS entries require a string url.")?
+                    .trim()
+                    .to_string();
+                let model = item
+                    .get("model")
+                    .and_then(|value| value.as_str())
+                    .ok_or("ASSISTANT_LOCAL_MODELS entries require a string model.")?
+                    .trim()
+                    .to_string();
+                let capabilities = item
+                    .get("capabilities")
+                    .and_then(|value| value.as_array())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str())
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| {
+                        vec!["controller".to_string(), "general_response".to_string()]
+                    });
+
+                if id.is_empty()
+                    || display_name.is_empty()
+                    || base_url.is_empty()
+                    || model.is_empty()
+                {
+                    return Err("ASSISTANT_LOCAL_MODELS entries require non-empty id, display_name, url, and model.".into());
+                }
+
+                if models.contains_key(&id) {
+                    return Err(format!("Duplicate local model id: {id}").into());
+                }
+
+                models.insert(
+                    id.clone(),
+                    LocalModelDefinition {
+                        id,
+                        display_name,
+                        base_url,
+                        model,
+                        capabilities,
+                    },
+                );
+            }
+        }
+
+        Ok(Self {
+            models: Arc::new(models),
+            active_model: Arc::new(RwLock::new("qwen".to_string())),
+        })
+    }
+
+    fn active_definition(&self) -> Result<LocalModelDefinition, Box<dyn Error>> {
+        let active = self
+            .active_model
+            .read()
+            .map_err(|_| "Active model state lock was poisoned.")?
+            .clone();
+
+        self.models
+            .get(&active)
+            .cloned()
+            .ok_or_else(|| format!("Active model '{active}' is not registered.").into())
+    }
+
+    fn active_model_id(&self) -> Result<String, Box<dyn Error>> {
+        Ok(self
+            .active_model
+            .read()
+            .map_err(|_| "Active model state lock was poisoned.")?
+            .clone())
+    }
+
+    fn switch_model(&self, model: &str) -> Result<ModelInfo, Box<dyn Error>> {
+        let normalized = model.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return Err("Model id cannot be empty.".into());
+        }
+
+        let definition = self.models.get(&normalized).ok_or_else(|| {
+            format!("Unknown local model '{normalized}'. Use :model list to see registered models.")
+        })?;
+
+        let available = self.probe_model(definition)?;
+        if !available {
+            return Err(format!(
+                "Local model '{}' is unavailable at {}.",
+                definition.display_name, definition.base_url
+            )
+            .into());
+        }
+
+        let mut active = self
+            .active_model
+            .write()
+            .map_err(|_| "Active model state lock was poisoned.")?;
+        *active = definition.id.clone();
+        drop(active);
+
+        self.model_info_with_availability(definition, available)
+    }
+
+    fn probe_model(&self, definition: &LocalModelDefinition) -> Result<bool, Box<dyn Error>> {
+        let endpoint = format!("{}/v1/models", definition.base_url.trim_end_matches('/'));
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(MODEL_PROBE_CONNECT_TIMEOUT)
+            .timeout(MODEL_PROBE_TIMEOUT)
+            .build()?;
+
+        match client.get(endpoint).send() {
+            Ok(response) => Ok(response.status().is_success()),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn model_info_with_availability(
+        &self,
+        definition: &LocalModelDefinition,
+        available: bool,
+    ) -> Result<ModelInfo, Box<dyn Error>> {
+        let active = self.active_model_id()?;
+
+        Ok(ModelInfo {
+            id: definition.id.clone(),
+            display_name: definition.display_name.clone(),
+            available,
+            active: active == definition.id,
+            capabilities: definition.capabilities.clone(),
+        })
+    }
+
+    fn model_info(&self, id: &str) -> Result<ModelInfo, Box<dyn Error>> {
+        let definition = self
+            .models
+            .get(id)
+            .ok_or_else(|| format!("Unknown local model '{id}'."))?;
+        let available = self.probe_model(definition)?;
+        Ok(self.model_info_with_availability(definition, available)?)
+    }
+
+    fn list_models(&self) -> Result<Vec<ModelInfo>, Box<dyn Error>> {
+        let mut ids = self.models.keys().cloned().collect::<Vec<_>>();
+        ids.sort();
+        ids.into_iter().map(|id| self.model_info(&id)).collect()
+    }
+
+    fn status(&self) -> Result<ModelState, Box<dyn Error>> {
+        let active_model = self.active_model_id()?;
+        let definition = self
+            .models
+            .get(&active_model)
+            .ok_or_else(|| format!("Active model '{active_model}' is not registered."))?;
+        let ready = self.probe_model(definition)?;
+
+        Ok(ModelState {
+            active_model: Some(active_model),
+            ready,
+        })
+    }
+}
+
+impl Controller for ModelSession {
+    fn plan(
+        &self,
+        context: &orchestrator::ControllerContext,
+    ) -> Result<orchestrator::ControllerPlan, Box<dyn Error>> {
+        let definition = self.active_definition()?;
+        let controller = LlamaCppController::new(definition.base_url, definition.model);
+        controller.plan(context)
+    }
+}
+
+trait ModelControllerState {
+    fn active_model_id(&self) -> Result<String, Box<dyn Error>>;
+    fn switch_model(&self, model: &str) -> Result<ModelInfo, Box<dyn Error>>;
+    fn list_models(&self) -> Result<Vec<ModelInfo>, Box<dyn Error>>;
+}
+
+impl ModelControllerState for ModelSession {
+    fn active_model_id(&self) -> Result<String, Box<dyn Error>> {
+        ModelSession::active_model_id(self)
+    }
+
+    fn switch_model(&self, model: &str) -> Result<ModelInfo, Box<dyn Error>> {
+        ModelSession::switch_model(self, model)
+    }
+
+    fn list_models(&self) -> Result<Vec<ModelInfo>, Box<dyn Error>> {
+        ModelSession::list_models(self)
+    }
+}
+
+struct RuntimeIpcHandler {
+    model_session: ModelSession,
+}
+
+impl ipc::RequestHandler for RuntimeIpcHandler {
+    fn handle(&self, request: WireRequest) -> WireResponse {
+        let id = request.id;
+
+        match request.method {
+            RequestMethod::Ping => WireResponse::ok(id, ResponsePayload::Pong),
+            RequestMethod::Health => WireResponse::ok(
+                id,
+                ResponsePayload::Health(HealthStatus {
+                    runtime: env!("CARGO_PKG_NAME").to_string(),
+                    ready: true,
+                }),
+            ),
+            RequestMethod::ModelList => match self.model_session.list_models() {
+                Ok(models) => WireResponse::ok(id, ResponsePayload::Models(ModelList { models })),
+                Err(error) => WireResponse::error(id, "model_list_failed", error.to_string()),
+            },
+            RequestMethod::ModelStatus => match self.model_session.status() {
+                Ok(status) => WireResponse::ok(id, ResponsePayload::ModelStatus(status)),
+                Err(error) => WireResponse::error(id, "model_status_failed", error.to_string()),
+            },
+            RequestMethod::ModelSwitch { model } => match self.model_session.switch_model(&model) {
+                Ok(_) => match self.model_session.status() {
+                    Ok(status) => WireResponse::ok(id, ResponsePayload::ModelStatus(status)),
+                    Err(error) => WireResponse::error(id, "model_status_failed", error.to_string()),
+                },
+                Err(error) => WireResponse::error(id, "model_switch_failed", error.to_string()),
+            },
+            _ => WireResponse::error(
+                id,
+                "unsupported",
+                "This IPC method is not implemented by the runtime service yet.",
+            ),
+        }
+    }
+}
 
 struct SessionController<C> {
     inner: C,
@@ -40,6 +335,27 @@ impl<C> SessionController<C> {
 
     fn start_new_session(&mut self) {
         self.session_id = Self::new_session_id();
+    }
+
+    fn active_model_id(&self) -> Result<String, Box<dyn Error>>
+    where
+        C: ModelControllerState,
+    {
+        self.inner.active_model_id()
+    }
+
+    fn switch_model(&self, model: &str) -> Result<ModelInfo, Box<dyn Error>>
+    where
+        C: ModelControllerState,
+    {
+        self.inner.switch_model(model)
+    }
+
+    fn list_models(&self) -> Result<Vec<ModelInfo>, Box<dyn Error>>
+    where
+        C: ModelControllerState,
+    {
+        self.inner.list_models()
     }
 
     fn truncate(text: &str, limit: usize) -> String {
@@ -249,6 +565,7 @@ fn print_status(
     db_path: &PathBuf,
     qwen_url: &str,
     qwen_model: &str,
+    active_model: &str,
     embedding_url: &str,
     embedding_model: &str,
     background_workers_enabled: bool,
@@ -262,7 +579,8 @@ fn print_status(
     println!("Memory root: {}", memory_root.display());
     println!("File root: {}", file_root.display());
     println!("SQLite DB: {}", db_path.display());
-    println!("Qwen: {} ({})", qwen_model, qwen_url);
+    println!("Qwen backend: {} ({})", qwen_model, qwen_url);
+    println!("Active controller model: {}", active_model);
     println!("Embeddings: {} ({})", embedding_model, embedding_url);
     println!(
         "Background workers: {}",
@@ -311,7 +629,30 @@ fn print_jobs(db: &SqliteMemoryDb, status: Option<&str>) -> Result<(), Box<dyn E
     Ok(())
 }
 
+fn parse_model_switch_command(text: &str) -> Option<String> {
+    let cleaned = text.trim().trim_end_matches(['.', '!', '?']).trim();
+    let lower = cleaned.to_ascii_lowercase();
+
+    for prefix in [
+        "switch to ",
+        "switch model to ",
+        "change model to ",
+        "use model ",
+        "use ",
+    ] {
+        if let Some(remainder) = lower.strip_prefix(prefix) {
+            let model = cleaned[prefix.len()..].trim();
+            if !remainder.trim().is_empty() && !model.is_empty() {
+                return Some(model.to_ascii_lowercase());
+            }
+        }
+    }
+
+    None
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    let daemon_mode = env::args().skip(1).any(|argument| argument == "--daemon");
     let memory_root = memory_root()?;
 
     std::fs::create_dir_all(&memory_root)?;
@@ -465,10 +806,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let tool_executor = IndexedToolExecutor::new(registry, indexer.clone());
 
-    let controller = SessionController::new(
-        LlamaCppController::new(qwen_url.clone(), qwen_model.clone()),
-        conversation_db,
-    );
+    let model_session = ModelSession::from_environment(&qwen_url, &qwen_model)?;
+
+    let controller = SessionController::new(model_session.clone(), conversation_db);
 
     let mut models = ModelRouter::new(qwen_url.clone(), qwen_model.clone());
 
@@ -536,9 +876,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
     println!("Ready.");
     println!(
-        "Commands: :quit, :exit, :new, :status, :health, :jobs [status], :tasks [status], :reminders [status], :memory-proposals, :memory-accept <id>, :memory-reject <id>"
+        "Commands: :quit, :exit, :new, :status, :health, :model [list|status|use <id>], :jobs [status], :tasks [status], :reminders [status], :memory-proposals, :memory-accept <id>, :memory-reject <id>"
     );
     println!();
+
+    if daemon_mode {
+        let handler = Arc::new(RuntimeIpcHandler {
+            model_session: model_session.clone(),
+        });
+        let socket_path = ipc::default_socket_path()?;
+        ipc::serve(&socket_path, handler)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+
+        if let Some(workers) = background_workers.as_mut() {
+            workers.shutdown();
+        }
+
+        return Ok(());
+    }
 
     loop {
         print!("assistant> ");
@@ -569,6 +924,49 @@ fn main() -> Result<(), Box<dyn Error>> {
             continue;
         }
 
+        if text == ":model" || text.starts_with(":model ") {
+            let argument = text.strip_prefix(":model").unwrap_or("").trim();
+
+            match argument {
+                "" | "list" => match orchestrator.controller.list_models() {
+                    Ok(models) => {
+                        println!();
+                        for model in models {
+                            println!(
+                                "{} | {} | {}{}",
+                                model.id,
+                                if model.active { "active" } else { "available" },
+                                model.display_name,
+                                if model.capabilities.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" | {}", model.capabilities.join(","))
+                                }
+                            );
+                        }
+                        println!();
+                    }
+                    Err(error) => eprintln!("Could not list models: {error}"),
+                },
+                "status" => match orchestrator.controller.active_model_id() {
+                    Ok(model) => println!("Active controller model: {model}"),
+                    Err(error) => eprintln!("Could not read active model: {error}"),
+                },
+                value if value.starts_with("use ") => {
+                    let model = value.strip_prefix("use ").unwrap_or("").trim();
+                    match orchestrator.controller.switch_model(model) {
+                        Ok(model) => println!(
+                            "Switched controller to {} ({}).",
+                            model.id, model.display_name
+                        ),
+                        Err(error) => eprintln!("Could not switch model: {error}"),
+                    }
+                }
+                _ => eprintln!("Usage: :model [list|status|use <id>]"),
+            }
+            continue;
+        }
+
         if matches!(text, ":status" | ":health") {
             let db = SqliteMemoryDb::open(&db_path)?;
             print_status(
@@ -578,6 +976,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 &db_path,
                 &qwen_url,
                 &qwen_model,
+                &orchestrator.controller.active_model_id()?,
                 &embedding_url_for_display,
                 &embedding_model_for_display,
                 background_workers_enabled,
@@ -739,8 +1138,26 @@ fn main() -> Result<(), Box<dyn Error>> {
             continue;
         }
 
-        if matches!(text, ":quit" | ":exit") {
-            break;
+        if let Some(model) = parse_model_switch_command(text) {
+            let matched_id = orchestrator
+                .controller
+                .list_models()?
+                .into_iter()
+                .find(|entry| entry.id == model || entry.display_name.to_ascii_lowercase() == model)
+                .map(|entry| entry.id);
+
+            if let Some(model_id) = matched_id {
+                match orchestrator.controller.switch_model(&model_id) {
+                    Ok(info) => {
+                        println!(
+                            "Switched controller to {} ({}).",
+                            info.id, info.display_name
+                        );
+                        continue;
+                    }
+                    Err(error) => eprintln!("Could not switch model: {error}"),
+                }
+            }
         }
 
         let request = orchestrator::UserRequest {
@@ -778,6 +1195,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+    use std::{io::Read, net::TcpListener, thread};
 
     struct FakeController {
         contexts: std::sync::Mutex<Vec<orchestrator::ControllerContext>>,
@@ -891,6 +1309,7 @@ mod session_tests {
             &PathBuf::from("/tmp/assistant.db"),
             "http://127.0.0.1:8080",
             "test-qwen",
+            "qwen",
             "http://127.0.0.1:8081",
             "test-embedding",
             false,
@@ -1090,6 +1509,150 @@ mod session_tests {
 
         assert_eq!(history[MAX_SESSION_TURNS - 1].1, "Response 11");
 
+        Ok(())
+    }
+
+    #[test]
+    fn model_switch_command_parses_explicit_switches() {
+        assert_eq!(
+            parse_model_switch_command("switch to gemma"),
+            Some("gemma".to_string())
+        );
+        assert_eq!(
+            parse_model_switch_command("Use model qwen."),
+            Some("qwen".to_string())
+        );
+        assert_eq!(
+            parse_model_switch_command("change model to phi"),
+            Some("phi".to_string())
+        );
+    }
+
+    #[test]
+    fn model_switch_command_ignores_unrelated_text() {
+        assert_eq!(parse_model_switch_command("summarize this note"), None);
+        assert_eq!(parse_model_switch_command(":model use qwen"), None);
+    }
+
+    fn spawn_ok_model_server() -> Result<(String, thread::JoinHandle<()>), Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let body = r#"{"object":"list","data":[]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+
+        Ok((format!("http://{address}"), handle))
+    }
+
+    fn unavailable_model_url() -> Result<String, Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        drop(listener);
+        Ok(format!("http://{address}"))
+    }
+
+    #[test]
+    fn model_list_reports_backend_availability() -> Result<(), Box<dyn Error>> {
+        let (available_url, server) = spawn_ok_model_server()?;
+        let unavailable_url = unavailable_model_url()?;
+
+        let mut models = HashMap::new();
+        models.insert(
+            "qwen".to_string(),
+            LocalModelDefinition {
+                id: "qwen".to_string(),
+                display_name: "Qwen3.5 4B".to_string(),
+                base_url: unavailable_url,
+                model: "qwen.gguf".to_string(),
+                capabilities: vec!["controller".to_string()],
+            },
+        );
+        models.insert(
+            "gemma".to_string(),
+            LocalModelDefinition {
+                id: "gemma".to_string(),
+                display_name: "Gemma 4 E4B".to_string(),
+                base_url: available_url,
+                model: "gemma.gguf".to_string(),
+                capabilities: vec!["controller".to_string()],
+            },
+        );
+
+        let session = ModelSession {
+            models: Arc::new(models),
+            active_model: Arc::new(RwLock::new("qwen".to_string())),
+        };
+
+        let models = session.list_models()?;
+        let gemma = models.iter().find(|model| model.id == "gemma").unwrap();
+        let qwen = models.iter().find(|model| model.id == "qwen").unwrap();
+
+        assert!(gemma.available);
+        assert!(!qwen.available);
+        assert!(qwen.active);
+        assert!(!gemma.active);
+
+        server
+            .join()
+            .map_err(|_| "Model probe test server panicked.")?;
+        Ok(())
+    }
+
+    #[test]
+    fn model_session_switch_rejects_unavailable_models() -> Result<(), Box<dyn Error>> {
+        let (available_url, server) = spawn_ok_model_server()?;
+        let unavailable_url = unavailable_model_url()?;
+
+        let mut models = HashMap::new();
+        models.insert(
+            "qwen".to_string(),
+            LocalModelDefinition {
+                id: "qwen".to_string(),
+                display_name: "Qwen3.5 4B".to_string(),
+                base_url: unavailable_url.clone(),
+                model: "qwen.gguf".to_string(),
+                capabilities: vec!["controller".to_string()],
+            },
+        );
+        models.insert(
+            "gemma".to_string(),
+            LocalModelDefinition {
+                id: "gemma".to_string(),
+                display_name: "Gemma 4 E4B".to_string(),
+                base_url: available_url,
+                model: "gemma.gguf".to_string(),
+                capabilities: vec!["controller".to_string()],
+            },
+        );
+
+        let session = ModelSession {
+            models: Arc::new(models),
+            active_model: Arc::new(RwLock::new("qwen".to_string())),
+        };
+
+        let selected = session.switch_model("gemma")?;
+        assert_eq!(selected.id, "gemma");
+        assert!(selected.available);
+        assert!(selected.active);
+        assert_eq!(session.active_model_id()?, "gemma");
+
+        let error = session.switch_model("qwen").unwrap_err();
+        assert!(error.to_string().contains("unavailable"));
+        assert_eq!(session.active_model_id()?, "gemma");
+
+        server
+            .join()
+            .map_err(|_| "Model probe test server panicked.")?;
         Ok(())
     }
 }

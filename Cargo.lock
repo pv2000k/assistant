@@ -30,6 +30,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "assistant-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "assistant-tui"
 version = "0.1.0"
 dependencies = [
@@ -1462,6 +1470,7 @@ dependencies = [
 name = "runtime"
 version = "0.1.0"
 dependencies = [
+ "assistant-protocol",
  "model-router",
  "orchestrator",
  "serde_json",
