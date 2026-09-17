@@ -30,6 +30,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "assistant-client"
+version = "0.1.0"
+dependencies = [
+ "assistant-protocol",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "assistant-protocol"
 version = "0.1.0"
 dependencies = [

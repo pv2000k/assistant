@@ -13,4 +13,5 @@ members = [
     "crates/runtime",
     "crates/tui",
     "crates/assistant-protocol",
+    "crates/assistant-client",
 ]
