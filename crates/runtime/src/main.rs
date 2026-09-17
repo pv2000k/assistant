@@ -1,13 +1,14 @@
 mod ipc;
 
 use assistant_protocol::{
-    ChatResponse, HealthStatus, ModelInfo, ModelList, ModelState, RequestMethod, ResponsePayload,
-    WireRequest, WireResponse,
+    ChatResponse, HealthStatus, JobList, MemoryProposalList, MemorySearchResult, ModelInfo,
+    ModelList, ModelState, ReminderList, RequestMethod, ResponsePayload, TaskList, WireRequest,
+    WireResponse,
 };
 use model_router::ModelRouter;
 use orchestrator::{
-    ApprovalHandler, Controller, HybridMemory, IndexedToolExecutor, LlamaCppController,
-    Orchestrator, PersistentMemoryIndexer, ToolCall, UserRequest,
+    ApprovalHandler, Controller, HybridMemory, IndexedToolExecutor, LlamaCppController, Memory,
+    MemoryIntentMode, MemoryQuery, Orchestrator, PersistentMemoryIndexer, ToolCall, UserRequest,
 };
 use sqlite_memory::SqliteMemoryDb;
 use std::{
@@ -275,9 +276,21 @@ type RuntimeOrchestrator =
 struct RuntimeIpcHandler {
     model_session: ModelSession,
     orchestrator: Arc<Mutex<RuntimeOrchestrator>>,
+    indexer: PersistentMemoryIndexer,
 }
 
 impl RuntimeIpcHandler {
+    fn with_orchestrator<T>(
+        &self,
+        action: impl FnOnce(&RuntimeOrchestrator) -> Result<T, Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>> {
+        let orchestrator = self
+            .orchestrator
+            .lock()
+            .map_err(|_| "Runtime orchestrator state lock was poisoned.")?;
+        action(&orchestrator)
+    }
+
     fn handle_chat(&self, id: u64, text: String) -> WireResponse {
         let request = UserRequest { text };
         let orchestrator = match self.orchestrator.lock() {
@@ -300,6 +313,105 @@ impl RuntimeIpcHandler {
                 WireResponse::ok(id, ResponsePayload::Chat(ChatResponse { text: response }))
             }
             Err(error) => WireResponse::error(id, "chat_failed", error.to_string()),
+        }
+    }
+
+    fn handle_tasks(&self, id: u64, status: Option<String>, limit: Option<usize>) -> WireResponse {
+        let limit = RequestMethod::list_limit(limit);
+        match self.with_orchestrator(|orchestrator| {
+            let records = orchestrator
+                .memory
+                .database()
+                .tasks(status.as_deref(), limit)?;
+            Ok(active_tasks(records, status.as_deref())
+                .into_iter()
+                .map(task_summary)
+                .collect::<Vec<_>>())
+        }) {
+            Ok(tasks) => WireResponse::ok(id, ResponsePayload::Tasks(TaskList { tasks })),
+            Err(error) => WireResponse::error(id, "tasks_list_failed", error.to_string()),
+        }
+    }
+
+    fn handle_reminders(
+        &self,
+        id: u64,
+        status: Option<String>,
+        limit: Option<usize>,
+    ) -> WireResponse {
+        let limit = RequestMethod::list_limit(limit);
+        match self.with_orchestrator(|orchestrator| {
+            let records = orchestrator
+                .memory
+                .database()
+                .reminders(status.as_deref(), limit)?;
+            Ok(active_reminders(records, status.as_deref())
+                .into_iter()
+                .map(reminder_summary)
+                .collect::<Vec<_>>())
+        }) {
+            Ok(reminders) => {
+                WireResponse::ok(id, ResponsePayload::Reminders(ReminderList { reminders }))
+            }
+            Err(error) => WireResponse::error(id, "reminders_list_failed", error.to_string()),
+        }
+    }
+
+    fn handle_memory_search(&self, id: u64, query: String, limit: Option<usize>) -> WireResponse {
+        let limit = RequestMethod::list_limit(limit);
+        let query = MemoryQuery {
+            query,
+            limit,
+            subject: None,
+            time: None,
+            mode: MemoryIntentMode::Unspecified,
+        };
+
+        match self.with_orchestrator(|orchestrator| {
+            Ok(orchestrator
+                .memory
+                .search_with_query(&query)?
+                .into_iter()
+                .map(|result| assistant_protocol::MemorySummary {
+                    id: result.id,
+                    text: result.text,
+                    score: result.score,
+                })
+                .collect::<Vec<_>>())
+        }) {
+            Ok(results) => {
+                WireResponse::ok(id, ResponsePayload::Memory(MemorySearchResult { results }))
+            }
+            Err(error) => WireResponse::error(id, "memory_search_failed", error.to_string()),
+        }
+    }
+
+    fn handle_memory_proposals(&self, id: u64, limit: Option<usize>) -> WireResponse {
+        let limit = RequestMethod::list_limit(limit);
+        match self.indexer.pending_memory_extraction_proposals(limit) {
+            Ok(proposals) => WireResponse::ok(
+                id,
+                ResponsePayload::Proposals(MemoryProposalList {
+                    proposals: proposals.into_iter().map(memory_proposal_summary).collect(),
+                }),
+            ),
+            Err(error) => WireResponse::error(id, "memory_proposals_failed", error.to_string()),
+        }
+    }
+
+    fn handle_jobs(&self, id: u64, status: Option<String>, limit: Option<usize>) -> WireResponse {
+        let limit = RequestMethod::list_limit(limit);
+        match self.with_orchestrator(|orchestrator| {
+            Ok(orchestrator
+                .memory
+                .database()
+                .jobs(status.as_deref(), limit)?
+                .into_iter()
+                .map(job_summary)
+                .collect::<Vec<_>>())
+        }) {
+            Ok(jobs) => WireResponse::ok(id, ResponsePayload::Jobs(JobList { jobs })),
+            Err(error) => WireResponse::error(id, "jobs_list_failed", error.to_string()),
         }
     }
 }
@@ -333,11 +445,15 @@ impl ipc::RequestHandler for RuntimeIpcHandler {
                 },
                 Err(error) => WireResponse::error(id, "model_switch_failed", error.to_string()),
             },
-            _ => WireResponse::error(
-                id,
-                "unsupported",
-                "This IPC method is not implemented by the runtime service yet.",
-            ),
+            RequestMethod::TasksList { status, limit } => self.handle_tasks(id, status, limit),
+            RequestMethod::RemindersList { status, limit } => {
+                self.handle_reminders(id, status, limit)
+            }
+            RequestMethod::MemorySearch { query, limit } => {
+                self.handle_memory_search(id, query, limit)
+            }
+            RequestMethod::MemoryProposals { limit } => self.handle_memory_proposals(id, limit),
+            RequestMethod::JobsList { status, limit } => self.handle_jobs(id, status, limit),
         }
     }
 }
@@ -545,6 +661,51 @@ fn active_reminders(
     }
 }
 
+fn task_summary(record: sqlite_memory::TaskRecord) -> assistant_protocol::TaskSummary {
+    assistant_protocol::TaskSummary {
+        id: record.id,
+        title: record.title,
+        status: record.status,
+        due_at: record.due_at,
+    }
+}
+
+fn reminder_summary(record: sqlite_memory::ReminderRecord) -> assistant_protocol::ReminderSummary {
+    assistant_protocol::ReminderSummary {
+        id: record.id,
+        title: record.title,
+        status: record.status,
+        due_at: record.due_at,
+    }
+}
+
+fn memory_proposal_summary(
+    proposal: sqlite_memory::MemoryExtractionProposal,
+) -> assistant_protocol::MemoryProposalSummary {
+    assistant_protocol::MemoryProposalSummary {
+        id: proposal.id,
+        decision: proposal.decision,
+        conversation_turn_id: proposal.conversation_turn_id.to_string(),
+    }
+}
+
+fn job_summary(job: sqlite_memory::Job) -> assistant_protocol::JobSummary {
+    let status = match job.status {
+        sqlite_memory::JobStatus::Queued => "queued",
+        sqlite_memory::JobStatus::Running => "running",
+        sqlite_memory::JobStatus::Completed => "completed",
+        sqlite_memory::JobStatus::Failed => "failed",
+        sqlite_memory::JobStatus::Cancelled => "cancelled",
+    };
+
+    assistant_protocol::JobSummary {
+        id: job.id,
+        job_type: job.job_type,
+        status: status.to_string(),
+        next_run_at: job.next_run_at,
+    }
+}
+
 fn print_tasks(db: &SqliteMemoryDb, status: Option<&str>) -> Result<(), Box<dyn Error>> {
     let records = active_tasks(db.tasks(status, 100)?, status);
 
@@ -691,6 +852,11 @@ enum ClientCommand {
     ModelList,
     ModelStatus,
     ModelSwitch(String),
+    Tasks(Option<String>),
+    Reminders(Option<String>),
+    MemorySearch(String),
+    MemoryProposals,
+    Jobs(Option<String>),
     Quit,
 }
 
@@ -703,12 +869,51 @@ fn parse_client_command(text: &str) -> Result<ClientCommand, String> {
         ":model" | ":model list" => Ok(ClientCommand::ModelList),
         ":model status" => Ok(ClientCommand::ModelStatus),
         ":chat" => Err("Usage: :chat <text>".to_string()),
+        ":tasks" => Ok(ClientCommand::Tasks(None)),
+        ":reminders" => Ok(ClientCommand::Reminders(None)),
+        ":memory-proposals" => Ok(ClientCommand::MemoryProposals),
+        ":jobs" => Ok(ClientCommand::Jobs(None)),
         _ if text.starts_with(":chat ") => {
             let message = text.strip_prefix(":chat ").unwrap_or("").trim();
             if message.is_empty() {
                 Err("Usage: :chat <text>".to_string())
             } else {
                 Ok(ClientCommand::Chat(message.to_string()))
+            }
+        }
+        _ if text.starts_with(":tasks ") => {
+            let status = text.strip_prefix(":tasks ").unwrap_or("").trim();
+            if status.is_empty() || status.contains(char::is_whitespace) {
+                Err("Usage: :tasks [status]".to_string())
+            } else {
+                Ok(ClientCommand::Tasks(Some(status.to_string())))
+            }
+        }
+        _ if text.starts_with(":reminders ") => {
+            let status = text.strip_prefix(":reminders ").unwrap_or("").trim();
+            if status.is_empty() || status.contains(char::is_whitespace) {
+                Err("Usage: :reminders [status]".to_string())
+            } else {
+                Ok(ClientCommand::Reminders(Some(status.to_string())))
+            }
+        }
+        _ if text.starts_with(":memory search ") => {
+            let query = text.strip_prefix(":memory search ").unwrap_or("").trim();
+            if query.is_empty() {
+                Err("Usage: :memory search <query>".to_string())
+            } else {
+                Ok(ClientCommand::MemorySearch(query.to_string()))
+            }
+        }
+        _ if text == ":memory search" => {
+            Err("Usage: :memory search <query>".to_string())
+        }
+        _ if text.starts_with(":jobs ") => {
+            let status = text.strip_prefix(":jobs ").unwrap_or("").trim();
+            if status.is_empty() || status.contains(char::is_whitespace) {
+                Err("Usage: :jobs [status]".to_string())
+            } else {
+                Ok(ClientCommand::Jobs(Some(status.to_string())))
             }
         }
         _ if text.starts_with(":model use ") => {
@@ -721,7 +926,7 @@ fn parse_client_command(text: &str) -> Result<ClientCommand, String> {
         }
         _ if !text.starts_with(':') => Ok(ClientCommand::Chat(text.to_string())),
         _ => Err(
-            "Client mode commands: :chat <text>, :ping, :health, :model [list|status|use <id>], :quit"
+            "Client commands: plain text, :chat <text>, :ping, :health, :model [list|status|use <id>], :tasks [status], :reminders [status], :memory search <query>, :memory-proposals, :jobs [status], :quit"
                 .to_string(),
         ),
     }
@@ -769,7 +974,79 @@ fn print_client_response(response: ResponsePayload) {
                 status.ready
             );
         }
-        other => println!("Unexpected client response: {other:?}"),
+        ResponsePayload::Tasks(task_list) => {
+            println!();
+            if task_list.tasks.is_empty() {
+                println!("No matching tasks.");
+            } else {
+                for task in task_list.tasks {
+                    println!(
+                        "{} | {} | {} | {}",
+                        task.id,
+                        task.status,
+                        task.due_at.as_deref().unwrap_or("no due date"),
+                        task.title
+                    );
+                }
+            }
+            println!();
+        }
+        ResponsePayload::Reminders(reminder_list) => {
+            println!();
+            if reminder_list.reminders.is_empty() {
+                println!("No matching reminders.");
+            } else {
+                for reminder in reminder_list.reminders {
+                    println!(
+                        "{} | {} | {} | {}",
+                        reminder.id,
+                        reminder.status,
+                        reminder.due_at.as_deref().unwrap_or("no due date"),
+                        reminder.title
+                    );
+                }
+            }
+            println!();
+        }
+        ResponsePayload::Memory(memory) => {
+            println!();
+            if memory.results.is_empty() {
+                println!("No memory results.");
+            } else {
+                for result in memory.results {
+                    println!("{} | {:.4} | {}", result.id, result.score, result.text);
+                }
+            }
+            println!();
+        }
+        ResponsePayload::Proposals(proposals) => {
+            println!();
+            if proposals.proposals.is_empty() {
+                println!("No pending memory proposals.");
+            } else {
+                for proposal in proposals.proposals {
+                    println!(
+                        "{} | {} | turn={}",
+                        proposal.id, proposal.decision, proposal.conversation_turn_id
+                    );
+                }
+            }
+            println!();
+        }
+        ResponsePayload::Jobs(job_list) => {
+            println!();
+            if job_list.jobs.is_empty() {
+                println!("No matching jobs.");
+            } else {
+                for job in job_list.jobs {
+                    println!(
+                        "{} | {} | {} | next_run={}",
+                        job.id, job.status, job.job_type, job.next_run_at
+                    );
+                }
+            }
+            println!();
+        }
     }
 }
 
@@ -822,6 +1099,22 @@ fn run_client_mode() -> Result<(), Box<dyn Error>> {
             ClientCommand::ModelList => RequestMethod::ModelList,
             ClientCommand::ModelStatus => RequestMethod::ModelStatus,
             ClientCommand::ModelSwitch(model) => RequestMethod::ModelSwitch { model },
+            ClientCommand::Tasks(status) => RequestMethod::TasksList {
+                status,
+                limit: None,
+            },
+            ClientCommand::Reminders(status) => RequestMethod::RemindersList {
+                status,
+                limit: None,
+            },
+            ClientCommand::MemorySearch(query) => {
+                RequestMethod::MemorySearch { query, limit: None }
+            }
+            ClientCommand::MemoryProposals => RequestMethod::MemoryProposals { limit: None },
+            ClientCommand::Jobs(status) => RequestMethod::JobsList {
+                status,
+                limit: None,
+            },
             ClientCommand::Quit => unreachable!(),
         };
 
@@ -1084,6 +1377,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let handler = Arc::new(RuntimeIpcHandler {
             model_session: model_session.clone(),
             orchestrator: Arc::new(Mutex::new(orchestrator)),
+            indexer: indexer.clone(),
         });
         let socket_path = ipc::default_socket_path()?;
         ipc::serve(&socket_path, handler)
@@ -1488,6 +1782,34 @@ mod session_tests {
             Ok(ClientCommand::Chat("hello".to_string()))
         );
         assert!(parse_client_command(":chat").is_err());
+    }
+
+    #[test]
+    fn client_command_parser_accepts_read_api_commands() {
+        assert_eq!(
+            parse_client_command(":tasks"),
+            Ok(ClientCommand::Tasks(None))
+        );
+        assert_eq!(
+            parse_client_command(":tasks open"),
+            Ok(ClientCommand::Tasks(Some("open".to_string())))
+        );
+        assert_eq!(
+            parse_client_command(":reminders"),
+            Ok(ClientCommand::Reminders(None))
+        );
+        assert_eq!(
+            parse_client_command(":memory search porsche"),
+            Ok(ClientCommand::MemorySearch("porsche".to_string()))
+        );
+        assert_eq!(
+            parse_client_command(":memory-proposals"),
+            Ok(ClientCommand::MemoryProposals)
+        );
+        assert_eq!(
+            parse_client_command(":jobs failed"),
+            Ok(ClientCommand::Jobs(Some("failed".to_string())))
+        );
     }
 
     #[test]
