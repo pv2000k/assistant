@@ -45,6 +45,8 @@ struct LocalModelDefinition {
 struct ModelSession {
     models: Arc<HashMap<String, LocalModelDefinition>>,
     active_model: Arc<RwLock<String>>,
+    model_root: Option<PathBuf>,
+    embedding_model: String,
 }
 
 impl ModelSession {
@@ -129,9 +131,19 @@ impl ModelSession {
             }
         }
 
+        let model_root = env::var_os("ASSISTANT_MODEL_ROOT")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join("AI/models")));
+        let embedding_model = env_or_default(
+            "ASSISTANT_EMBEDDING_MODEL",
+            "bge-small-en-v1.5-q8_0.gguf".to_string(),
+        );
+
         Ok(Self {
             models: Arc::new(models),
             active_model: Arc::new(RwLock::new("qwen".to_string())),
+            model_root,
+            embedding_model,
         })
     }
 
@@ -142,10 +154,82 @@ impl ModelSession {
             .map_err(|_| "Active model state lock was poisoned.")?
             .clone();
 
-        self.models
-            .get(&active)
-            .cloned()
-            .ok_or_else(|| format!("Active model '{active}' is not registered.").into())
+        if let Some(definition) = self.models.get(&active) {
+            return Ok(definition.clone());
+        }
+
+        self.dynamic_local_definition(&active)
+    }
+
+    fn dynamic_local_definition(&self, id: &str) -> Result<LocalModelDefinition, Box<dyn Error>> {
+        let filename = id
+            .strip_prefix("local:")
+            .ok_or_else(|| format!("Unknown local model '{id}'."))?;
+
+        let base = self
+            .models
+            .get("qwen")
+            .ok_or("Qwen local model is not registered.")?;
+
+        validate_local_model_filename(filename)?;
+
+        Ok(LocalModelDefinition {
+            id: format!("local:{filename}"),
+            display_name: filename.to_string(),
+            base_url: base.base_url.clone(),
+            model: filename.to_string(),
+            capabilities: base.capabilities.clone(),
+        })
+    }
+
+    fn definition_for_switch(&self, model: &str) -> Result<LocalModelDefinition, Box<dyn Error>> {
+        let requested = model.trim();
+        if requested.is_empty() {
+            return Err("Model id cannot be empty.".into());
+        }
+
+        let normalized = requested.to_ascii_lowercase();
+        if self.models.contains_key(&normalized) {
+            return self
+                .models
+                .get(&normalized)
+                .cloned()
+                .ok_or_else(|| "Registered model disappeared.".into());
+        }
+
+        if self
+            .models
+            .get("qwen")
+            .is_some_and(|qwen| qwen.model == requested)
+        {
+            return self
+                .models
+                .get("qwen")
+                .cloned()
+                .ok_or_else(|| "Qwen model disappeared.".into());
+        }
+
+        let id = if let Some(filename) = requested.strip_prefix("local:") {
+            validate_local_model_filename(filename)?;
+            format!("local:{filename}")
+        } else {
+            validate_local_model_filename(requested)?;
+            format!("local:{requested}")
+        };
+
+        self.dynamic_local_definition(&id)
+    }
+
+    fn activate_model(
+        &self,
+        definition: &LocalModelDefinition,
+    ) -> Result<ModelInfo, Box<dyn Error>> {
+        *self
+            .active_model
+            .write()
+            .map_err(|_| "Active model state lock was poisoned.")? = definition.id.clone();
+
+        self.model_info_with_availability(definition, true)
     }
 
     fn active_model_id(&self) -> Result<String, Box<dyn Error>> {
@@ -157,16 +241,8 @@ impl ModelSession {
     }
 
     fn switch_model(&self, model: &str) -> Result<ModelInfo, Box<dyn Error>> {
-        let normalized = model.trim().to_ascii_lowercase();
-        if normalized.is_empty() {
-            return Err("Model id cannot be empty.".into());
-        }
-
-        let definition = self.models.get(&normalized).ok_or_else(|| {
-            format!("Unknown local model '{normalized}'. Use :model list to see registered models.")
-        })?;
-
-        let available = self.probe_model(definition)?;
+        let definition = self.definition_for_switch(model)?;
+        let available = self.probe_model(&definition)?;
         if !available {
             return Err(format!(
                 "Local model '{}' is unavailable at {}.",
@@ -175,18 +251,11 @@ impl ModelSession {
             .into());
         }
 
-        let mut active = self
-            .active_model
-            .write()
-            .map_err(|_| "Active model state lock was poisoned.")?;
-        *active = definition.id.clone();
-        drop(active);
-
-        self.model_info_with_availability(definition, available)
+        self.activate_model(&definition)
     }
 
-    fn probe_model(&self, definition: &LocalModelDefinition) -> Result<bool, Box<dyn Error>> {
-        let endpoint = format!("{}/v1/models", definition.base_url.trim_end_matches('/'));
+    fn probe_model(&self, _definition: &LocalModelDefinition) -> Result<bool, Box<dyn Error>> {
+        let endpoint = format!("{}/v1/models", _definition.base_url.trim_end_matches('/'));
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(MODEL_PROBE_CONNECT_TIMEOUT)
             .timeout(MODEL_PROBE_TIMEOUT)
@@ -218,15 +287,41 @@ impl ModelSession {
         let definition = self
             .models
             .get(id)
-            .ok_or_else(|| format!("Unknown local model '{id}'."))?;
-        let available = self.probe_model(definition)?;
-        Ok(self.model_info_with_availability(definition, available)?)
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| self.dynamic_local_definition(id))?;
+        let available = self.probe_model(&definition)?;
+        Ok(self.model_info_with_availability(&definition, available)?)
     }
 
     fn list_models(&self) -> Result<Vec<ModelInfo>, Box<dyn Error>> {
         let mut ids = self.models.keys().cloned().collect::<Vec<_>>();
         ids.sort();
-        ids.into_iter().map(|id| self.model_info(&id)).collect()
+
+        let mut models = ids
+            .into_iter()
+            .map(|id| self.model_info(&id))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if let Some(root) = &self.model_root {
+            for filename in discover_generation_model_filenames(root, &self.embedding_model)? {
+                if self
+                    .models
+                    .get("qwen")
+                    .is_some_and(|qwen| qwen.model == filename)
+                {
+                    continue;
+                }
+
+                let id = format!("local:{filename}");
+                let definition = self.dynamic_local_definition(&id)?;
+                let available = self.probe_model(&definition)?;
+                models.push(self.model_info_with_availability(&definition, available)?);
+            }
+        }
+
+        models.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(models)
     }
 
     fn status(&self) -> Result<ModelState, Box<dyn Error>> {
@@ -234,8 +329,10 @@ impl ModelSession {
         let definition = self
             .models
             .get(&active_model)
-            .ok_or_else(|| format!("Active model '{active_model}' is not registered."))?;
-        let ready = self.probe_model(definition)?;
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| self.dynamic_local_definition(&active_model))?;
+        let ready = self.probe_model(&definition)?;
 
         Ok(ModelState {
             active_model: Some(active_model),
@@ -630,6 +727,84 @@ impl RuntimeIpcHandler {
     }
 }
 
+impl RuntimeIpcHandler {
+    fn handle_model_switch(&self, id: u64, model: String) -> WireResponse {
+        let definition = match self.model_session.definition_for_switch(&model) {
+            Ok(definition) => definition,
+            Err(error) => return WireResponse::error(id, "model_switch_failed", error.to_string()),
+        };
+
+        let orchestrator = match self.orchestrator.lock() {
+            Ok(orchestrator) => orchestrator,
+            Err(_) => {
+                return WireResponse::error(
+                    id,
+                    "model_switch_failed",
+                    "Runtime orchestrator state lock was poisoned.",
+                );
+            }
+        };
+
+        let running_background_work = orchestrator
+            .memory
+            .database()
+            .jobs(Some("running"), 1000)
+            .map(|jobs| !jobs.is_empty())
+            .unwrap_or(true);
+        if running_background_work {
+            return WireResponse::error(
+                id,
+                "model_switch_busy",
+                "A background job is currently running. Wait for it to finish before switching the local generation model.",
+            );
+        }
+
+        let qwen_base_url = self
+            .model_session
+            .models
+            .get("qwen")
+            .map(|model| model.base_url.clone())
+            .unwrap_or_default();
+
+        if definition.base_url == qwen_base_url {
+            let mut services = match self._local_services.lock() {
+                Ok(services) => services,
+                Err(_) => {
+                    return WireResponse::error(
+                        id,
+                        "model_switch_failed",
+                        "Local service supervisor state lock was poisoned.",
+                    );
+                }
+            };
+
+            if let Err(error) = services.switch_generation_model(&definition.model) {
+                return WireResponse::error(id, "model_switch_failed", error.to_string());
+            }
+
+            if let Err(error) = orchestrator.models.set_qwen_model(&definition.model) {
+                return WireResponse::error(id, "model_switch_failed", error.to_string());
+            }
+
+            match self.model_session.activate_model(&definition) {
+                Ok(_) => match self.model_session.status() {
+                    Ok(status) => WireResponse::ok(id, ResponsePayload::ModelStatus(status)),
+                    Err(error) => WireResponse::error(id, "model_status_failed", error.to_string()),
+                },
+                Err(error) => WireResponse::error(id, "model_switch_failed", error.to_string()),
+            }
+        } else {
+            match self.model_session.switch_model(&definition.id) {
+                Ok(_) => match self.model_session.status() {
+                    Ok(status) => WireResponse::ok(id, ResponsePayload::ModelStatus(status)),
+                    Err(error) => WireResponse::error(id, "model_status_failed", error.to_string()),
+                },
+                Err(error) => WireResponse::error(id, "model_switch_failed", error.to_string()),
+            }
+        }
+    }
+}
+
 impl ipc::RequestHandler for RuntimeIpcHandler {
     fn handle(&self, request: WireRequest) -> WireResponse {
         let _request_guard = self.lifecycle.begin_request();
@@ -653,13 +828,7 @@ impl ipc::RequestHandler for RuntimeIpcHandler {
                 Ok(status) => WireResponse::ok(id, ResponsePayload::ModelStatus(status)),
                 Err(error) => WireResponse::error(id, "model_status_failed", error.to_string()),
             },
-            RequestMethod::ModelSwitch { model } => match self.model_session.switch_model(&model) {
-                Ok(_) => match self.model_session.status() {
-                    Ok(status) => WireResponse::ok(id, ResponsePayload::ModelStatus(status)),
-                    Err(error) => WireResponse::error(id, "model_status_failed", error.to_string()),
-                },
-                Err(error) => WireResponse::error(id, "model_switch_failed", error.to_string()),
-            },
+            RequestMethod::ModelSwitch { model } => self.handle_model_switch(id, model),
             RequestMethod::TasksList { status, limit } => self.handle_tasks(id, status, limit),
             RequestMethod::RemindersList { status, limit } => {
                 self.handle_reminders(id, status, limit)
@@ -1079,6 +1248,44 @@ fn print_jobs(db: &SqliteMemoryDb, status: Option<&str>) -> Result<(), Box<dyn E
     }
     println!();
     Ok(())
+}
+
+fn validate_local_model_filename(model: &str) -> Result<(), Box<dyn Error>> {
+    let path = std::path::Path::new(model);
+    if model.is_empty()
+        || path.file_name().and_then(|value| value.to_str()) != Some(model)
+        || path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_none_or(|value| !value.eq_ignore_ascii_case("gguf"))
+    {
+        return Err(format!("Local model must be a single .gguf filename: {model}").into());
+    }
+
+    Ok(())
+}
+
+fn discover_generation_model_filenames(
+    root: &std::path::Path,
+    embedding_model: &str,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut models = std::fs::read_dir(root)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("gguf"))
+        })
+        .filter_map(|path| {
+            let filename = path.file_name()?.to_str()?.to_string();
+            (filename != embedding_model).then_some(filename)
+        })
+        .collect::<Vec<_>>();
+
+    models.sort_by_key(|value| value.to_ascii_lowercase());
+    Ok(models)
 }
 
 fn parse_model_switch_command(text: &str) -> Option<String> {
@@ -1823,11 +2030,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let tool_executor = IndexedToolExecutor::new(registry, indexer.clone());
 
+    let qwen_model_state = Arc::new(RwLock::new(qwen_model.clone()));
     let model_session = ModelSession::from_environment(&qwen_url, &qwen_model)?;
 
     let controller = SessionController::new(model_session.clone(), conversation_db);
 
-    let mut models = ModelRouter::new(qwen_url.clone(), qwen_model.clone());
+    let mut models =
+        ModelRouter::new_with_shared_qwen_model(qwen_url.clone(), Arc::clone(&qwen_model_state));
 
     if let Ok(api_key) = env::var("ASSISTANT_CLAUDE_API_KEY") {
         if api_key.trim().is_empty() {
@@ -1862,11 +2071,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(true);
 
     let mut background_workers = if background_workers_enabled {
-        match sqlite_ingest::BackgroundWorkers::start(
+        match sqlite_ingest::BackgroundWorkers::start_with_shared_model(
             &memory_root,
             &db_path,
             qwen_url.clone(),
-            qwen_model.clone(),
+            Arc::clone(&qwen_model_state),
         ) {
             Ok(workers) => {
                 println!("Background workers: memory extraction + reminder scheduler enabled.");
@@ -2771,6 +2980,40 @@ mod session_tests {
     }
 
     #[test]
+    fn dynamic_local_model_definition_uses_filename() -> Result<(), Box<dyn Error>> {
+        let session =
+            ModelSession::from_environment("http://127.0.0.1:18080", "Qwen3.5-4B-Q4_K_M.gguf")?;
+
+        let definition = session.dynamic_local_definition("local:Mistral-7B.gguf")?;
+        assert_eq!(definition.id, "local:Mistral-7B.gguf");
+        assert_eq!(definition.display_name, "Mistral-7B.gguf");
+        assert_eq!(definition.base_url, "http://127.0.0.1:18080");
+        assert_eq!(definition.model, "Mistral-7B.gguf");
+        Ok(())
+    }
+
+    #[test]
+    fn discovered_model_filenames_exclude_embedding_model() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("Qwen.gguf"), b"model")?;
+        std::fs::write(directory.path().join("Mistral.GGUF"), b"model")?;
+        std::fs::write(
+            directory.path().join("bge-small-en-v1.5-q8_0.gguf"),
+            b"embedding",
+        )?;
+        std::fs::write(directory.path().join("notes.txt"), b"not a model")?;
+
+        let models =
+            discover_generation_model_filenames(directory.path(), "bge-small-en-v1.5-q8_0.gguf")?;
+
+        assert_eq!(
+            models,
+            vec!["Mistral.GGUF".to_string(), "Qwen.gguf".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn model_list_reports_backend_availability() -> Result<(), Box<dyn Error>> {
         let (available_url, server) = spawn_ok_model_server()?;
         let unavailable_url = unavailable_model_url()?;
@@ -2800,6 +3043,8 @@ mod session_tests {
         let session = ModelSession {
             models: Arc::new(models),
             active_model: Arc::new(RwLock::new("qwen".to_string())),
+            model_root: None,
+            embedding_model: "bge-small-en-v1.5-q8_0.gguf".to_string(),
         };
 
         let models = session.list_models()?;
@@ -2847,6 +3092,8 @@ mod session_tests {
         let session = ModelSession {
             models: Arc::new(models),
             active_model: Arc::new(RwLock::new("qwen".to_string())),
+            model_root: None,
+            embedding_model: "bge-small-en-v1.5-q8_0.gguf".to_string(),
         };
 
         let selected = session.switch_model("gemma")?;

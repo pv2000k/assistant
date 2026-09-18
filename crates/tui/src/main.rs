@@ -319,6 +319,27 @@ impl App {
         }
     }
 
+    fn switch_selected_model(&mut self) {
+        if self.tab != Tab::Models || self.models.is_empty() {
+            return;
+        }
+
+        let model = self.models[self.selected].id.clone();
+        match self.client.request(RequestMethod::ModelSwitch {
+            model: model.clone(),
+        }) {
+            Ok(ResponsePayload::ModelStatus(status)) => {
+                self.model_status = Some(status);
+                match self.refresh() {
+                    Ok(()) => self.message = format!("Switched to {model}."),
+                    Err(error) => self.message = format!("Model switched, refresh failed: {error}"),
+                }
+            }
+            Ok(other) => self.message = format!("Unexpected model switch response: {other:?}"),
+            Err(error) => self.message = format!("Model switch failed: {error}"),
+        }
+    }
+
     fn run_search(&mut self) {
         self.input_mode = InputMode::None;
         let query = self.input.trim().to_string();
@@ -407,6 +428,7 @@ impl App {
             },
             KeyCode::Char('a') => self.accept_selected_proposal(),
             KeyCode::Char('x') => self.reject_selected_proposal(),
+            KeyCode::Enter if self.tab == Tab::Models => self.switch_selected_model(),
             KeyCode::Char('/') if self.tab == Tab::Search => {
                 self.input_mode = InputMode::Search;
                 self.input.clear();
@@ -485,6 +507,7 @@ impl App {
                 Tab::Proposals => {
                     "q quit | tab switch | ↑↓ select | a accept | x reject | r refresh"
                 }
+                Tab::Models => "q quit | tab switch | ↑↓ select | Enter switch | r refresh",
                 _ => "q quit | tab switch | ↑↓ select | r refresh",
             }
         } else {
@@ -752,14 +775,46 @@ fn run_startup(
                 selected = (selected + 1).min(models.len().saturating_sub(1));
             }
             KeyCode::Enter => {
-                if runtime.is_some() {
-                    let lease = ClientLease::acquire(socket_path)?;
-                    return Ok(StartupOutcome::Continue(lease));
-                }
-
                 let model = models
                     .get(selected)
                     .ok_or("No model is selected at startup.")?;
+
+                if let Some(runtime) = runtime.as_ref() {
+                    let lease = ClientLease::acquire(socket_path)?;
+                    let local_id = format!("local:{}", model.filename);
+                    let desired_id = if runtime.active_model_id == local_id {
+                        local_id
+                    } else if runtime.active_model_id == "qwen"
+                        && runtime.model_display_name == model.filename
+                    {
+                        "qwen".to_string()
+                    } else {
+                        local_id
+                    };
+
+                    if desired_id != runtime.active_model_id {
+                        let client = IpcClient::new(socket_path);
+                        match client.request(assistant_protocol::RequestMethod::ModelSwitch {
+                            model: desired_id.clone(),
+                        })? {
+                            ResponsePayload::ModelStatus(status) if status.ready => {}
+                            ResponsePayload::ModelStatus(_) => {
+                                return Err(format!(
+                                    "Runtime switched to {desired_id}, but the selected model is not ready."
+                                )
+                                .into());
+                            }
+                            other => {
+                                return Err(
+                                    format!("Unexpected model switch response: {other:?}").into()
+                                );
+                            }
+                        }
+                    }
+
+                    return Ok(StartupOutcome::Continue(lease));
+                }
+
                 let runtime_bin = runtime_binary_path()?;
                 let mut launcher = RuntimeLaunch::new(&runtime_bin, socket_path, model)?;
                 launcher.wait_until_ready(socket_path)?;

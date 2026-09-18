@@ -22,6 +22,8 @@ const SERVICE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Debug)]
 pub struct LocalServiceSupervisor {
     generation: ManagedProcess,
+    generation_url: String,
+    generation_model: String,
     embedding: ManagedProcess,
 }
 
@@ -47,8 +49,65 @@ impl LocalServiceSupervisor {
 
         Ok(Self {
             generation,
+            generation_url: generation_url.to_string(),
+            generation_model: generation_model.to_string(),
             embedding,
         })
+    }
+
+    pub fn switch_generation_model(&mut self, model: &str) -> Result<(), Box<dyn Error>> {
+        validate_generation_model_name(model)?;
+        if model == self.generation_model {
+            return Ok(());
+        }
+
+        if !self.generation.is_owned() {
+            return Err(
+                "The assistant does not own the current generation process, so it cannot switch models in place."
+                    .into(),
+            );
+        }
+
+        let old_model = self.generation_model.clone();
+        let model_path = resolve_model_path(&model_root()?, model, "generation")?;
+
+        self.generation.stop();
+
+        match ensure_generation_service(&self.generation_url, model, &model_path, &llama_root()?) {
+            Ok(generation) => {
+                self.generation = generation;
+                self.generation_model = model.to_string();
+                Ok(())
+            }
+            Err(error) => {
+                let old_path = resolve_model_path(&model_root()?, &old_model, "generation");
+                match old_path {
+                    Ok(old_path) => match ensure_generation_service(
+                        &self.generation_url,
+                        &old_model,
+                        &old_path,
+                        &llama_root()?,
+                    ) {
+                        Ok(generation) => {
+                            self.generation = generation;
+                            self.generation_model = old_model.clone();
+                            Err(format!(
+                                "Could not switch generation model to '{model}': {error}. Restored '{old_model}'."
+                            )
+                            .into())
+                        }
+                        Err(recovery_error) => Err(format!(
+                            "Could not switch generation model to '{model}': {error}. Could not restore '{old_model}': {recovery_error}"
+                        )
+                        .into()),
+                    },
+                    Err(recovery_error) => Err(format!(
+                        "Could not switch generation model to '{model}': {error}. Could not resolve previous model '{old_model}': {recovery_error}"
+                    )
+                    .into()),
+                }
+            }
+        }
     }
 }
 
@@ -78,6 +137,10 @@ impl ManagedProcess {
             name: name.into(),
             child: Some(child),
         }
+    }
+
+    fn is_owned(&self) -> bool {
+        self.child.is_some()
     }
 
     fn stop(&mut self) {
@@ -290,6 +353,22 @@ fn refuse_if_port_is_occupied(url: &str, kind: &str) -> Result<(), Box<dyn Error
     }
 }
 
+fn validate_generation_model_name(model: &str) -> Result<(), Box<dyn Error>> {
+    let model = model.trim();
+    let path = Path::new(model);
+    if model.is_empty()
+        || path.file_name().and_then(|value| value.to_str()) != Some(model)
+        || path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_none_or(|value| !value.eq_ignore_ascii_case("gguf"))
+    {
+        return Err(format!("Generation model must be a single .gguf filename: {model}").into());
+    }
+
+    Ok(())
+}
+
 fn resolve_model_path(root: &Path, model: &str, kind: &str) -> Result<PathBuf, Box<dyn Error>> {
     let candidate = PathBuf::from(model);
     let path = if candidate.is_absolute() {
@@ -307,7 +386,11 @@ fn resolve_model_path(root: &Path, model: &str, kind: &str) -> Result<PathBuf, B
         .into());
     }
 
-    if path.extension().and_then(|value| value.to_str()) != Some("gguf") {
+    if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_none_or(|value| !value.eq_ignore_ascii_case("gguf"))
+    {
         return Err(format!(
             "Configured {kind} model must be a .gguf file: {}",
             path.display()
@@ -397,5 +480,13 @@ mod tests {
     #[test]
     fn rejects_path_suffix() {
         assert!(parse_http_endpoint("http://127.0.0.1:8080/base").is_err());
+    }
+
+    #[test]
+    fn generation_model_name_rejects_path_traversal() {
+        assert!(validate_generation_model_name("../other.gguf").is_err());
+        assert!(validate_generation_model_name("/tmp/other.gguf").is_err());
+        assert!(validate_generation_model_name("other.gguf").is_ok());
+        assert!(validate_generation_model_name("OTHER.GGUF").is_ok());
     }
 }

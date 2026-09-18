@@ -7,7 +7,7 @@ use sqlite_memory::SqliteMemoryDb;
 use std::{
     path::Path,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -27,6 +27,20 @@ impl BackgroundWorkers {
         qwen_url: impl Into<String>,
         qwen_model: impl Into<String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_with_shared_model(
+            memory_root,
+            db_path,
+            qwen_url,
+            Arc::new(RwLock::new(qwen_model.into())),
+        )
+    }
+
+    pub fn start_with_shared_model(
+        memory_root: impl AsRef<Path>,
+        db_path: impl AsRef<Path>,
+        qwen_url: impl Into<String>,
+        qwen_model: Arc<RwLock<String>>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let memory_root = memory_root.as_ref().to_path_buf();
         let db_path = db_path.as_ref().to_path_buf();
         std::fs::create_dir_all(&memory_root)?;
@@ -35,7 +49,6 @@ impl BackgroundWorkers {
         db.initialize_schema()?;
 
         let qwen_url = qwen_url.into();
-        let qwen_model = qwen_model.into();
         let stop = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::with_capacity(2);
 
@@ -45,7 +58,7 @@ impl BackgroundWorkers {
                 let stop = Arc::clone(&stop);
                 let db_path = db_path.clone();
                 let qwen_url = qwen_url.clone();
-                let qwen_model = qwen_model.clone();
+                let qwen_model = Arc::clone(&qwen_model);
                 move || {
                     let db = match SqliteMemoryDb::open(&db_path) {
                         Ok(db) => db,
@@ -58,8 +71,10 @@ impl BackgroundWorkers {
                         eprintln!("Memory extraction worker schema initialization failed: {error}");
                         return;
                     }
-                    let worker =
-                        MemoryExtractionWorker::new(db, ModelRouter::new(qwen_url, qwen_model));
+                    let worker = MemoryExtractionWorker::new(
+                        db,
+                        ModelRouter::new_with_shared_qwen_model(qwen_url, qwen_model),
+                    );
                     while !stop.load(Ordering::Relaxed) {
                         if let Err(error) = worker.run_once() {
                             eprintln!("Memory extraction worker: {error}");
