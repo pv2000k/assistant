@@ -400,6 +400,49 @@ impl RuntimeIpcHandler {
         }
     }
 
+    fn handle_memory_proposal_accept(&self, id: u64, proposal_id: String) -> WireResponse {
+        let proposal_id_for_response = proposal_id.clone();
+        match self.indexer.apply_memory_extraction_proposal(&proposal_id) {
+            Ok(paths) => WireResponse::ok(
+                id,
+                ResponsePayload::Mutation(assistant_protocol::MutationResult {
+                    tool: "memory.proposals".to_string(),
+                    operation: "accept".to_string(),
+                    output: serde_json::json!({
+                        "proposal_id": proposal_id_for_response,
+                        "applied": true,
+                        "idempotent": paths.is_empty(),
+                        "paths": paths,
+                    }),
+                }),
+            ),
+            Err(error) => {
+                WireResponse::error(id, "memory_proposal_accept_failed", error.to_string())
+            }
+        }
+    }
+
+    fn handle_memory_proposal_reject(&self, id: u64, proposal_id: String) -> WireResponse {
+        let proposal_id_for_response = proposal_id.clone();
+        match self.indexer.reject_memory_extraction_proposal(&proposal_id) {
+            Ok(rejected) => WireResponse::ok(
+                id,
+                ResponsePayload::Mutation(assistant_protocol::MutationResult {
+                    tool: "memory.proposals".to_string(),
+                    operation: "reject".to_string(),
+                    output: serde_json::json!({
+                        "proposal_id": proposal_id_for_response,
+                        "rejected": rejected,
+                        "idempotent": !rejected,
+                    }),
+                }),
+            ),
+            Err(error) => {
+                WireResponse::error(id, "memory_proposal_reject_failed", error.to_string())
+            }
+        }
+    }
+
     fn handle_jobs(&self, id: u64, status: Option<String>, limit: Option<usize>) -> WireResponse {
         let limit = RequestMethod::list_limit(limit);
         match self.with_orchestrator(|orchestrator| {
@@ -579,6 +622,12 @@ impl ipc::RequestHandler for RuntimeIpcHandler {
                 self.handle_memory_search(id, query, limit)
             }
             RequestMethod::MemoryProposals { limit } => self.handle_memory_proposals(id, limit),
+            RequestMethod::MemoryProposalAccept { id: proposal_id } => {
+                self.handle_memory_proposal_accept(id, proposal_id)
+            }
+            RequestMethod::MemoryProposalReject { id: proposal_id } => {
+                self.handle_memory_proposal_reject(id, proposal_id)
+            }
             RequestMethod::JobsList { status, limit } => self.handle_jobs(id, status, limit),
             RequestMethod::TasksMutate {
                 operation,
@@ -997,6 +1046,8 @@ enum ClientCommand {
     Reminders(Option<String>),
     MemorySearch(String),
     MemoryProposals,
+    MemoryProposalAccept(String),
+    MemoryProposalReject(String),
     Jobs(Option<String>),
     TaskMutation {
         operation: String,
@@ -1212,6 +1263,24 @@ fn parse_client_command(text: &str) -> Result<ClientCommand, String> {
         ":tasks" => Ok(ClientCommand::Tasks(None)),
         ":reminders" => Ok(ClientCommand::Reminders(None)),
         ":memory-proposals" => Ok(ClientCommand::MemoryProposals),
+        ":memory-accept" => Err("Usage: :memory-accept <proposal-id>".to_string()),
+        ":memory-reject" => Err("Usage: :memory-reject <proposal-id>".to_string()),
+        _ if text.starts_with(":memory-accept ") => {
+            let proposal_id = text.strip_prefix(":memory-accept ").unwrap_or("").trim();
+            if proposal_id.is_empty() || proposal_id.contains(char::is_whitespace) {
+                Err("Usage: :memory-accept <proposal-id>".to_string())
+            } else {
+                Ok(ClientCommand::MemoryProposalAccept(proposal_id.to_string()))
+            }
+        }
+        _ if text.starts_with(":memory-reject ") => {
+            let proposal_id = text.strip_prefix(":memory-reject ").unwrap_or("").trim();
+            if proposal_id.is_empty() || proposal_id.contains(char::is_whitespace) {
+                Err("Usage: :memory-reject <proposal-id>".to_string())
+            } else {
+                Ok(ClientCommand::MemoryProposalReject(proposal_id.to_string()))
+            }
+        }
         ":jobs" => Ok(ClientCommand::Jobs(None)),
         ":task" => Err("Usage: :task [create|update|complete|cancel] ...".to_string()),
         ":reminder" => Err("Usage: :reminder [create|update|cancel] ...".to_string()),
@@ -1270,7 +1339,7 @@ fn parse_client_command(text: &str) -> Result<ClientCommand, String> {
         }
         _ if !text.starts_with(':') => Ok(ClientCommand::Chat(text.to_string())),
         _ => Err(
-            "Client commands: plain text, :chat <text>, :ping, :health, :model [list|status|use <id>], :tasks [status], :reminders [status], :memory search <query>, :memory-proposals, :jobs [status], :task [create|update|complete|cancel] ..., :reminder [create|update|cancel] ..., :quit"
+            "Client commands: plain text, :chat <text>, :ping, :health, :model [list|status|use <id>], :tasks [status], :reminders [status], :memory search <query>, :memory-proposals, :memory-accept <id>, :memory-reject <id>, :jobs [status], :task [create|update|complete|cancel] ..., :reminder [create|update|cancel] ..., :quit"
                 .to_string(),
         ),
     }
@@ -1407,7 +1476,7 @@ fn run_client_mode() -> Result<(), Box<dyn Error>> {
     println!("============================================================");
     println!("Runtime socket: {}", socket_path.display());
     println!(
-        "Commands: plain text or :chat <text>, :ping, :health, :model [list|status|use <id>], :tasks [status], :reminders [status], :memory search <query>, :memory-proposals, :jobs [status], :task [create|update|complete|cancel] ..., :reminder [create|update|cancel] ..., :quit"
+        "Commands: plain text or :chat <text>, :ping, :health, :model [list|status|use <id>], :tasks [status], :reminders [status], :memory search <query>, :memory-proposals, :memory-accept <id>, :memory-reject <id>, :jobs [status], :task [create|update|complete|cancel] ..., :reminder [create|update|cancel] ..., :quit"
     );
     println!("============================================================");
     println!();
@@ -1459,6 +1528,12 @@ fn run_client_mode() -> Result<(), Box<dyn Error>> {
                 RequestMethod::MemorySearch { query, limit: None }
             }
             ClientCommand::MemoryProposals => RequestMethod::MemoryProposals { limit: None },
+            ClientCommand::MemoryProposalAccept(proposal_id) => {
+                RequestMethod::MemoryProposalAccept { id: proposal_id }
+            }
+            ClientCommand::MemoryProposalReject(proposal_id) => {
+                RequestMethod::MemoryProposalReject { id: proposal_id }
+            }
             ClientCommand::Jobs(status) => RequestMethod::JobsList {
                 status,
                 limit: None,
@@ -2183,6 +2258,18 @@ mod session_tests {
             Ok(ClientCommand::MemoryProposals)
         );
         assert_eq!(
+            parse_client_command(":memory-accept proposal-123"),
+            Ok(ClientCommand::MemoryProposalAccept(
+                "proposal-123".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_client_command(":memory-reject proposal-456"),
+            Ok(ClientCommand::MemoryProposalReject(
+                "proposal-456".to_string()
+            ))
+        );
+        assert_eq!(
             parse_client_command(":jobs failed"),
             Ok(ClientCommand::Jobs(Some("failed".to_string())))
         );
@@ -2281,6 +2368,8 @@ mod session_tests {
     #[test]
     fn client_command_parser_rejects_unrecognized_input() {
         assert!(parse_client_command(":model switch qwen").is_err());
+        assert!(parse_client_command(":memory-accept").is_err());
+        assert!(parse_client_command(":memory-reject").is_err());
         assert!(parse_client_command(":unknown").is_err());
     }
 

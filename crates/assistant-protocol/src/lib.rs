@@ -64,6 +64,12 @@ pub enum RequestMethod {
         #[serde(default)]
         limit: Option<usize>,
     },
+    MemoryProposalAccept {
+        id: String,
+    },
+    MemoryProposalReject {
+        id: String,
+    },
     JobsList {
         #[serde(default)]
         status: Option<String>,
@@ -457,6 +463,26 @@ mod tests {
         let decoded = WireRequest::decode_line(&encoded)?;
 
         assert_eq!(decoded, request);
+        Ok(())
+    }
+
+    #[test]
+    fn memory_proposal_mutation_requests_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let accept = WireRequest::new(
+            18,
+            RequestMethod::MemoryProposalAccept {
+                id: "proposal-123".to_string(),
+            },
+        );
+        let reject = WireRequest::new(
+            19,
+            RequestMethod::MemoryProposalReject {
+                id: "proposal-456".to_string(),
+            },
+        );
+
+        assert_eq!(WireRequest::decode_line(&accept.encode_line()?)?, accept);
+        assert_eq!(WireRequest::decode_line(&reject.encode_line()?)?, reject);
         Ok(())
     }
 
