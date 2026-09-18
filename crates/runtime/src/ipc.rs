@@ -1,3 +1,4 @@
+pub use assistant_client::default_socket_path;
 use assistant_protocol::{WireRequest, WireResponse};
 use std::{
     error::Error,
@@ -7,25 +8,12 @@ use std::{
         fs::FileTypeExt,
         net::{UnixListener, UnixStream},
     },
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
 
 pub trait RequestHandler: Send + Sync + 'static {
     fn handle(&self, request: WireRequest) -> WireResponse;
-}
-
-pub fn default_socket_path() -> Result<PathBuf, Box<dyn Error>> {
-    if let Some(value) = std::env::var_os("ASSISTANT_SOCKET_PATH") {
-        return Ok(PathBuf::from(value));
-    }
-
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return Ok(PathBuf::from(runtime_dir).join("assistant.sock"));
-    }
-
-    let home = std::env::var_os("HOME").ok_or("HOME environment variable is not set.")?;
-    Ok(PathBuf::from(home).join(".cache/assistant/assistant.sock"))
 }
 
 pub fn serve<H>(socket_path: &Path, handler: Arc<H>) -> Result<(), Box<dyn Error + Send + Sync>>

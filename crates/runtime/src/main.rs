@@ -1,4 +1,5 @@
 mod ipc;
+mod process_supervisor;
 
 use assistant_protocol::{
     ChatResponse, HealthStatus, JobList, MemoryProposalList, MemorySearchResult, ModelInfo,
@@ -11,6 +12,7 @@ use orchestrator::{
     MemoryIntentMode, MemoryQuery, Orchestrator, PersistentMemoryIndexer, ToolCall, ToolExecutor,
     UserRequest,
 };
+use process_supervisor::LocalServiceSupervisor;
 use sqlite_memory::SqliteMemoryDb;
 use std::{
     collections::HashMap,
@@ -278,6 +280,7 @@ struct RuntimeIpcHandler {
     model_session: ModelSession,
     orchestrator: Arc<Mutex<RuntimeOrchestrator>>,
     indexer: PersistentMemoryIndexer,
+    _local_services: Arc<Mutex<LocalServiceSupervisor>>,
 }
 
 impl RuntimeIpcHandler {
@@ -1633,6 +1636,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Embeddings:   {}", embedding_url);
     println!("============================================================");
 
+    let local_services =
+        LocalServiceSupervisor::start(&qwen_url, &qwen_model, &embedding_url, &embedding_model)?;
+
     let indexer = PersistentMemoryIndexer::new(
         &db_path,
         &memory_root,
@@ -1829,6 +1835,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             model_session: model_session.clone(),
             orchestrator: Arc::new(Mutex::new(orchestrator)),
             indexer: indexer.clone(),
+            _local_services: Arc::new(Mutex::new(local_services)),
         });
         let socket_path = ipc::default_socket_path()?;
         ipc::serve(&socket_path, handler)

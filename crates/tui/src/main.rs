@@ -1,11 +1,15 @@
-use std::{env, error::Error, io, path::PathBuf, time::Duration};
+use std::{error::Error, io, path::PathBuf, time::Duration};
 
+use assistant_client::{IpcClient, IpcClientError, default_socket_path};
+use assistant_protocol::{
+    ChatResponse, HealthStatus, JobSummary, MemoryProposalSummary, ModelInfo, ModelState,
+    ReminderSummary, RequestMethod, ResponsePayload, TaskSummary,
+};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use orchestrator::PersistentMemoryIndexer;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -14,42 +18,17 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
-use sqlite_memory::{
-    ConversationTurn, Job, JobStatus, MemoryExtractionProposal, ReminderRecord, SqliteMemoryDb,
-    TaskRecord,
-};
 
-const TABS: [&str; 7] = [
+const TABS: [&str; 8] = [
     "Overview",
     "Tasks",
     "Reminders",
     "Proposals",
-    "Conversation",
+    "Chat",
+    "Models",
     "Jobs",
     "Search",
 ];
-
-fn env_or_default(name: &str, default: String) -> String {
-    env::var(name).unwrap_or(default)
-}
-
-fn memory_root() -> Result<PathBuf, Box<dyn Error>> {
-    if let Ok(value) = env::var("ASSISTANT_MEMORY_ROOT") {
-        return Ok(PathBuf::from(value));
-    }
-    let home = env::var("HOME").map(PathBuf::from)?;
-    Ok(home.join("assistant-memory"))
-}
-
-fn db_path(memory_root: &PathBuf) -> PathBuf {
-    PathBuf::from(env_or_default(
-        "ASSISTANT_SQLITE_DB_PATH",
-        memory_root
-            .join("assistant.db")
-            .to_string_lossy()
-            .into_owned(),
-    ))
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -57,7 +36,8 @@ enum Tab {
     Tasks,
     Reminders,
     Proposals,
-    Conversation,
+    Chat,
+    Models,
     Jobs,
     Search,
 }
@@ -69,9 +49,10 @@ impl Tab {
             Self::Tasks => 1,
             Self::Reminders => 2,
             Self::Proposals => 3,
-            Self::Conversation => 4,
-            Self::Jobs => 5,
-            Self::Search => 6,
+            Self::Chat => 4,
+            Self::Models => 5,
+            Self::Jobs => 6,
+            Self::Search => 7,
         }
     }
 
@@ -81,118 +62,171 @@ impl Tab {
             1 => Self::Tasks,
             2 => Self::Reminders,
             3 => Self::Proposals,
-            4 => Self::Conversation,
-            5 => Self::Jobs,
+            4 => Self::Chat,
+            5 => Self::Models,
+            6 => Self::Jobs,
             _ => Self::Search,
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    None,
+    Search,
+    Chat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChatExchange {
+    user: String,
+    assistant: String,
+}
+
 struct App {
-    db: SqliteMemoryDb,
-    indexer: PersistentMemoryIndexer,
-    memory_root: PathBuf,
-    db_path: PathBuf,
-    qwen_url: String,
-    qwen_model: String,
-    embedding_url: String,
-    embedding_model: String,
-    background_workers_enabled: bool,
+    client: IpcClient,
+    socket_path: PathBuf,
+    health: Option<HealthStatus>,
+    model_status: Option<ModelState>,
+    models: Vec<ModelInfo>,
+    tasks: Vec<TaskSummary>,
+    reminders: Vec<ReminderSummary>,
+    proposals: Vec<MemoryProposalSummary>,
+    jobs: Vec<JobSummary>,
+    chat: Vec<ChatExchange>,
     tab: Tab,
     selected: usize,
-    search_mode: bool,
-    search_query: String,
+    input_mode: InputMode,
+    input: String,
     search_results: Vec<(String, String, f64)>,
-    tasks: Vec<TaskRecord>,
-    reminders: Vec<ReminderRecord>,
-    proposals: Vec<MemoryExtractionProposal>,
-    conversation: Vec<ConversationTurn>,
-    jobs: Vec<Job>,
     message: String,
 }
 
 impl App {
     fn new() -> Result<Self, Box<dyn Error>> {
-        let memory_root = memory_root()?;
-        std::fs::create_dir_all(&memory_root)?;
-        let db_path = db_path(&memory_root);
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        let socket_path = default_socket_path()?;
+        let client = IpcClient::new(&socket_path);
+        let mut app = Self::from_client(client, socket_path);
+        if let Err(error) = app.refresh() {
+            app.message = format!("Assistant runtime unavailable: {error}");
         }
-
-        let qwen_url = env_or_default("ASSISTANT_QWEN_URL", "http://127.0.0.1:8080".to_string());
-        let qwen_model =
-            env_or_default("ASSISTANT_QWEN_MODEL", "Qwen3.5-4B-Q4_K_M.gguf".to_string());
-        let embedding_url = env_or_default(
-            "ASSISTANT_EMBEDDING_URL",
-            "http://127.0.0.1:8081".to_string(),
-        );
-        let embedding_model = env_or_default(
-            "ASSISTANT_EMBEDDING_MODEL",
-            "bge-small-en-v1.5-q8_0.gguf".to_string(),
-        );
-        let background_workers_enabled = env::var("ASSISTANT_BACKGROUND_WORKERS")
-            .map(|value| {
-                !matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "no"
-                )
-            })
-            .unwrap_or(true);
-
-        let db = SqliteMemoryDb::open(&db_path)?;
-        db.initialize_schema()?;
-        let indexer = PersistentMemoryIndexer::new(
-            &db_path,
-            &memory_root,
-            embedding_url.clone(),
-            embedding_model.clone(),
-        )?;
-
-        let mut app = Self {
-            db,
-            indexer,
-            memory_root,
-            db_path,
-            qwen_url,
-            qwen_model,
-            embedding_url,
-            embedding_model,
-            background_workers_enabled,
-            tab: Tab::Overview,
-            selected: 0,
-            search_mode: false,
-            search_query: String::new(),
-            search_results: Vec::new(),
-            tasks: Vec::new(),
-            reminders: Vec::new(),
-            proposals: Vec::new(),
-            conversation: Vec::new(),
-            jobs: Vec::new(),
-            message: String::new(),
-        };
-        app.refresh()?;
         Ok(app)
     }
 
-    fn refresh(&mut self) -> Result<(), Box<dyn Error>> {
-        self.tasks = self.db.tasks(None, 200)?;
-        self.reminders = self.db.reminders(None, 200)?;
-        self.proposals = self.indexer.pending_memory_extraction_proposals(50)?;
-        self.conversation = self.db.recent_conversation_turns_all(30)?;
-        self.jobs = self.db.jobs(None, 100)?;
-        if !self.search_query.trim().is_empty() {
-            self.search_results = self.db.search(&self.search_query, 50)?;
-        } else {
+    fn from_client(client: IpcClient, socket_path: PathBuf) -> Self {
+        Self {
+            client,
+            socket_path,
+            health: None,
+            model_status: None,
+            models: Vec::new(),
+            tasks: Vec::new(),
+            reminders: Vec::new(),
+            proposals: Vec::new(),
+            jobs: Vec::new(),
+            chat: Vec::new(),
+            tab: Tab::Overview,
+            selected: 0,
+            input_mode: InputMode::None,
+            input: String::new(),
+            search_results: Vec::new(),
+            message: String::new(),
+        }
+    }
+
+    fn refresh(&mut self) -> Result<(), IpcClientError> {
+        self.health = Some(self.request_health()?);
+        self.model_status = Some(self.request_model_status()?);
+        self.models = self.request_models()?;
+        self.tasks = self.request_tasks()?;
+        self.reminders = self.request_reminders()?;
+        self.proposals = self.request_proposals()?;
+        self.jobs = self.request_jobs()?;
+        if self.tab == Tab::Search && !self.input.trim().is_empty() {
+            self.search_results = self.request_search(&self.input)?;
+        } else if self.tab != Tab::Search {
             self.search_results.clear();
         }
-        let len = self.current_len();
-        if len == 0 {
-            self.selected = 0;
-        } else {
-            self.selected = self.selected.min(len - 1);
-        }
+        self.selected = self
+            .current_len()
+            .checked_sub(1)
+            .map_or(0, |last| self.selected.min(last));
         Ok(())
+    }
+
+    fn request_health(&self) -> Result<HealthStatus, IpcClientError> {
+        match self.client.request(RequestMethod::Health)? {
+            ResponsePayload::Health(value) => Ok(value),
+            other => Err(unexpected_response("health", other)),
+        }
+    }
+
+    fn request_model_status(&self) -> Result<ModelState, IpcClientError> {
+        match self.client.request(RequestMethod::ModelStatus)? {
+            ResponsePayload::ModelStatus(value) => Ok(value),
+            other => Err(unexpected_response("model status", other)),
+        }
+    }
+
+    fn request_models(&self) -> Result<Vec<ModelInfo>, IpcClientError> {
+        match self.client.request(RequestMethod::ModelList)? {
+            ResponsePayload::Models(value) => Ok(value.models),
+            other => Err(unexpected_response("model list", other)),
+        }
+    }
+
+    fn request_tasks(&self) -> Result<Vec<TaskSummary>, IpcClientError> {
+        match self.client.request(RequestMethod::TasksList {
+            status: None,
+            limit: Some(200),
+        })? {
+            ResponsePayload::Tasks(value) => Ok(value.tasks),
+            other => Err(unexpected_response("tasks", other)),
+        }
+    }
+
+    fn request_reminders(&self) -> Result<Vec<ReminderSummary>, IpcClientError> {
+        match self.client.request(RequestMethod::RemindersList {
+            status: None,
+            limit: Some(200),
+        })? {
+            ResponsePayload::Reminders(value) => Ok(value.reminders),
+            other => Err(unexpected_response("reminders", other)),
+        }
+    }
+
+    fn request_proposals(&self) -> Result<Vec<MemoryProposalSummary>, IpcClientError> {
+        match self
+            .client
+            .request(RequestMethod::MemoryProposals { limit: Some(50) })?
+        {
+            ResponsePayload::Proposals(value) => Ok(value.proposals),
+            other => Err(unexpected_response("memory proposals", other)),
+        }
+    }
+
+    fn request_jobs(&self) -> Result<Vec<JobSummary>, IpcClientError> {
+        match self.client.request(RequestMethod::JobsList {
+            status: None,
+            limit: Some(100),
+        })? {
+            ResponsePayload::Jobs(value) => Ok(value.jobs),
+            other => Err(unexpected_response("jobs", other)),
+        }
+    }
+
+    fn request_search(&self, query: &str) -> Result<Vec<(String, String, f64)>, IpcClientError> {
+        match self.client.request(RequestMethod::MemorySearch {
+            query: query.to_string(),
+            limit: Some(50),
+        })? {
+            ResponsePayload::Memory(value) => Ok(value
+                .results
+                .into_iter()
+                .map(|item| (item.id, item.text, item.score))
+                .collect()),
+            other => Err(unexpected_response("memory search", other)),
+        }
     }
 
     fn current_len(&self) -> usize {
@@ -201,7 +235,8 @@ impl App {
             Tab::Tasks => self.tasks.len(),
             Tab::Reminders => self.reminders.len(),
             Tab::Proposals => self.proposals.len(),
-            Tab::Conversation => self.conversation.len(),
+            Tab::Chat => self.chat.len(),
+            Tab::Models => self.models.len(),
             Tab::Jobs => self.jobs.len(),
             Tab::Search => self.search_results.len(),
         }
@@ -210,7 +245,9 @@ impl App {
     fn set_tab(&mut self, tab: Tab) {
         self.tab = tab;
         self.selected = 0;
-        self.search_mode = false;
+        self.input_mode = InputMode::None;
+        self.input.clear();
+        self.message.clear();
     }
 
     fn next_tab(&mut self) {
@@ -240,15 +277,18 @@ impl App {
             return;
         }
         let id = self.proposals[self.selected].id.clone();
-        match self.indexer.apply_memory_extraction_proposal(&id) {
-            Ok(paths) if paths.is_empty() => {
-                self.message = "Proposal was already applied.".to_string()
+        match self
+            .client
+            .request(RequestMethod::MemoryProposalAccept { id: id.clone() })
+        {
+            Ok(ResponsePayload::Mutation(result)) => {
+                self.message = format!("Accepted {id}: {}", compact_json(&result.output));
+                if let Err(error) = self.refresh() {
+                    self.message = format!("Accepted {id}, refresh failed: {error}");
+                }
             }
-            Ok(paths) => {
-                self.message = format!("Applied proposal: {}", paths.join(", "));
-                let _ = self.refresh();
-            }
-            Err(error) => self.message = format!("Apply failed: {error}"),
+            Ok(other) => self.message = format!("Unexpected accept response: {other:?}"),
+            Err(error) => self.message = format!("Accept failed: {error}"),
         }
     }
 
@@ -257,25 +297,61 @@ impl App {
             return;
         }
         let id = self.proposals[self.selected].id.clone();
-        match self.indexer.reject_memory_extraction_proposal(&id) {
-            Ok(true) => {
-                self.message = "Proposal rejected.".to_string();
-                let _ = self.refresh();
+        match self
+            .client
+            .request(RequestMethod::MemoryProposalReject { id: id.clone() })
+        {
+            Ok(ResponsePayload::Mutation(result)) => {
+                self.message = format!("Rejected {id}: {}", compact_json(&result.output));
+                if let Err(error) = self.refresh() {
+                    self.message = format!("Rejected {id}, refresh failed: {error}");
+                }
             }
-            Ok(false) => self.message = "Proposal was already handled.".to_string(),
+            Ok(other) => self.message = format!("Unexpected reject response: {other:?}"),
             Err(error) => self.message = format!("Reject failed: {error}"),
         }
     }
 
     fn run_search(&mut self) {
-        self.search_mode = false;
-        match self.db.search(&self.search_query, 50) {
+        self.input_mode = InputMode::None;
+        let query = self.input.trim().to_string();
+        if query.is_empty() {
+            self.search_results.clear();
+            self.message = "Search query is empty.".to_string();
+            return;
+        }
+        match self.request_search(&query) {
             Ok(results) => {
                 self.search_results = results;
                 self.selected = 0;
                 self.message = format!("{} search result(s).", self.search_results.len());
             }
             Err(error) => self.message = format!("Search failed: {error}"),
+        }
+    }
+
+    fn send_chat(&mut self) {
+        self.input_mode = InputMode::None;
+        let text = self.input.trim().to_string();
+        self.input.clear();
+        if text.is_empty() {
+            return;
+        }
+
+        match self
+            .client
+            .request(RequestMethod::Chat { text: text.clone() })
+        {
+            Ok(ResponsePayload::Chat(ChatResponse { text: response })) => {
+                self.chat.push(ChatExchange {
+                    user: text,
+                    assistant: response,
+                });
+                self.selected = self.chat.len().saturating_sub(1);
+                self.message.clear();
+            }
+            Ok(other) => self.message = format!("Unexpected chat response: {other:?}"),
+            Err(error) => self.message = format!("Chat failed: {error}"),
         }
     }
 
@@ -287,19 +363,29 @@ impl App {
             return Ok(true);
         }
 
-        if self.search_mode {
-            match key.code {
-                KeyCode::Esc => self.search_mode = false,
-                KeyCode::Enter => self.run_search(),
-                KeyCode::Backspace => {
-                    self.search_query.pop();
+        match self.input_mode {
+            InputMode::Search | InputMode::Chat => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.input_mode = InputMode::None;
+                        self.input.clear();
+                    }
+                    KeyCode::Enter => match self.input_mode {
+                        InputMode::Search => self.run_search(),
+                        InputMode::Chat => self.send_chat(),
+                        InputMode::None => unreachable!(),
+                    },
+                    KeyCode::Backspace => {
+                        self.input.pop();
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.input.push(c)
+                    }
+                    _ => {}
                 }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.search_query.push(c)
-                }
-                _ => {}
+                return Ok(true);
             }
-            return Ok(true);
+            InputMode::None => {}
         }
 
         match key.code {
@@ -308,14 +394,21 @@ impl App {
             KeyCode::BackTab => self.previous_tab(),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-            KeyCode::Char('r') => {
-                self.refresh()?;
-                self.message = "Refreshed.".to_string();
-            }
+            KeyCode::Char('r') => match self.refresh() {
+                Ok(()) => self.message = "Refreshed from assistant runtime.".to_string(),
+                Err(error) => self.message = format!("Refresh failed: {error}"),
+            },
             KeyCode::Char('a') => self.accept_selected_proposal(),
             KeyCode::Char('x') => self.reject_selected_proposal(),
-            KeyCode::Char('/') if self.tab == Tab::Search => self.search_mode = true,
-            KeyCode::Char(c @ '1'..='7') => {
+            KeyCode::Char('/') if self.tab == Tab::Search => {
+                self.input_mode = InputMode::Search;
+                self.input.clear();
+            }
+            KeyCode::Char('c') if self.tab == Tab::Chat => {
+                self.input_mode = InputMode::Chat;
+                self.input.clear();
+            }
+            KeyCode::Char(c @ '1'..='8') => {
                 self.set_tab(Tab::from_index(c as usize - '1' as usize))
             }
             _ => {}
@@ -325,12 +418,13 @@ impl App {
 
     fn title(&self) -> String {
         let title = TABS[self.tab.index()];
-        if self.search_mode {
-            format!("Search: {}_", self.search_query)
-        } else if self.tab == Tab::Proposals {
-            format!("{title}  [a approve | x reject]")
-        } else {
-            title.to_string()
+        match self.input_mode {
+            InputMode::Search => format!("Search: {}_", self.input),
+            InputMode::Chat => format!("Chat: {}_", self.input),
+            InputMode::None if self.tab == Tab::Proposals => {
+                format!("{title}  [a accept | x reject]")
+            }
+            InputMode::None => title.to_string(),
         }
     }
 
@@ -361,7 +455,7 @@ impl App {
             Paragraph::new(Line::from(tabs)).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Assistant TUI"),
+                    .title(format!("Assistant / Crona  |  {}", self.connection_title())),
             ),
             vertical[0],
         );
@@ -371,13 +465,21 @@ impl App {
             Tab::Tasks => self.draw_tasks(frame, vertical[1]),
             Tab::Reminders => self.draw_reminders(frame, vertical[1]),
             Tab::Proposals => self.draw_proposals(frame, vertical[1]),
-            Tab::Conversation => self.draw_conversation(frame, vertical[1]),
+            Tab::Chat => self.draw_chat(frame, vertical[1]),
+            Tab::Models => self.draw_models(frame, vertical[1]),
             Tab::Jobs => self.draw_jobs(frame, vertical[1]),
             Tab::Search => self.draw_search(frame, vertical[1]),
         }
 
         let footer = if self.message.is_empty() {
-            "q quit | tab switch | ↑↓ select | r refresh | / search | a/x proposal action"
+            match self.tab {
+                Tab::Chat => "q quit | tab switch | ↑↓ select | c chat | r refresh",
+                Tab::Search => "q quit | tab switch | ↑↓ select | / search | r refresh",
+                Tab::Proposals => {
+                    "q quit | tab switch | ↑↓ select | a accept | x reject | r refresh"
+                }
+                _ => "q quit | tab switch | ↑↓ select | r refresh",
+            }
         } else {
             &self.message
         };
@@ -387,47 +489,45 @@ impl App {
         );
     }
 
+    fn connection_title(&self) -> String {
+        match &self.health {
+            Some(health) if health.ready => "● runtime ready".to_string(),
+            Some(_) => "○ runtime not ready".to_string(),
+            None => format!("○ {}", self.socket_path.display()),
+        }
+    }
+
     fn draw_overview(&self, frame: &mut Frame, area: Rect) {
-        let queued = self
-            .jobs
-            .iter()
-            .filter(|job| matches!(job.status, JobStatus::Queued))
-            .count();
-        let running = self
-            .jobs
-            .iter()
-            .filter(|job| matches!(job.status, JobStatus::Running))
-            .count();
+        let health = self.health.as_ref();
+        let active_model = self
+            .model_status
+            .as_ref()
+            .and_then(|status| status.active_model.as_deref())
+            .unwrap_or("unknown");
+        let ready = self
+            .model_status
+            .as_ref()
+            .map(|status| status.ready)
+            .unwrap_or(false);
         let text = vec![
-            Line::from(format!("Memory root: {}", self.memory_root.display())),
-            Line::from(format!("SQLite DB:   {}", self.db_path.display())),
+            Line::from(format!("Assistant socket: {}", self.socket_path.display())),
             Line::from(format!(
-                "Qwen:        {} ({})",
-                self.qwen_model, self.qwen_url
+                "Runtime:          {}",
+                health
+                    .map(|value| value.runtime.as_str())
+                    .unwrap_or("unavailable")
             )),
             Line::from(format!(
-                "Embeddings:  {} ({})",
-                self.embedding_model, self.embedding_url
+                "Runtime ready:    {}",
+                health.map(|value| value.ready).unwrap_or(false)
             )),
-            Line::from(format!(
-                "Workers:     {}",
-                if self.background_workers_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            )),
-            Line::from(format!("Tasks:       {}", self.tasks.len())),
-            Line::from(format!("Reminders:   {}", self.reminders.len())),
-            Line::from(format!("Proposals:   {} pending", self.proposals.len())),
-            Line::from(format!(
-                "Jobs:        {} queued, {} running",
-                queued, running
-            )),
-            Line::from(format!(
-                "Conversation: {} recent turns",
-                self.conversation.len()
-            )),
+            Line::from(format!("Active model:     {active_model}")),
+            Line::from(format!("Model ready:      {ready}")),
+            Line::from(format!("Tasks:            {}", self.tasks.len())),
+            Line::from(format!("Reminders:        {}", self.reminders.len())),
+            Line::from(format!("Pending proposals: {}", self.proposals.len())),
+            Line::from(format!("Jobs:             {}", self.jobs.len())),
+            Line::from(format!("Local chat turns: {}", self.chat.len())),
         ];
         frame.render_widget(
             Paragraph::new(text)
@@ -463,39 +563,59 @@ impl App {
 
     fn draw_proposals(&self, frame: &mut Frame, area: Rect) {
         let items = self.proposals.iter().map(|proposal| {
-            let summary = proposal_summary(proposal);
             ListItem::new(format!(
-                "{}  [{}]  {}",
-                proposal.id, proposal.decision, summary
+                "{}  [{}]  turn={}",
+                proposal.id, proposal.decision, proposal.conversation_turn_id
             ))
         });
         self.draw_list(frame, area, items.collect(), &self.title());
     }
 
-    fn draw_conversation(&self, frame: &mut Frame, area: Rect) {
-        let items = self.conversation.iter().map(|turn| {
-            let user = compact(&turn.user_text, 80);
-            let assistant = compact(&turn.assistant_text, 100);
+    fn draw_chat(&self, frame: &mut Frame, area: Rect) {
+        if self.chat.is_empty() {
+            self.draw_list(
+                frame,
+                area,
+                vec![ListItem::new("Press c to chat with the assistant runtime.")],
+                &self.title(),
+            );
+            return;
+        }
+
+        let items = self.chat.iter().map(|exchange| {
             ListItem::new(vec![
-                Line::from(format!("{}  You: {}", turn.created_at, user)),
-                Line::from(format!("        Assistant: {}", assistant)),
+                Line::from(format!("You: {}", compact(&exchange.user, 160))),
+                Line::from(format!("Assistant: {}", compact(&exchange.assistant, 220))),
             ])
         });
-        self.draw_list(frame, area, items.collect(), "Recent conversation");
+        self.draw_list(frame, area, items.collect(), &self.title());
+    }
+
+    fn draw_models(&self, frame: &mut Frame, area: Rect) {
+        let active = self
+            .model_status
+            .as_ref()
+            .and_then(|status| status.active_model.as_deref());
+        let items = self.models.iter().map(|model| {
+            let marker = if active == Some(model.id.as_str()) {
+                '*'
+            } else {
+                ' '
+            };
+            let availability = if model.available { "ready" } else { "offline" };
+            ListItem::new(format!(
+                "{marker} [{}] {}  {}",
+                availability, model.id, model.display_name
+            ))
+        });
+        self.draw_list(frame, area, items.collect(), &self.title());
     }
 
     fn draw_jobs(&self, frame: &mut Frame, area: Rect) {
         let items = self.jobs.iter().map(|job| {
-            let status = match job.status {
-                JobStatus::Queued => "queued",
-                JobStatus::Running => "running",
-                JobStatus::Completed => "completed",
-                JobStatus::Failed => "failed",
-                JobStatus::Cancelled => "cancelled",
-            };
             ListItem::new(format!(
                 "{}  [{}] {}  next={}",
-                job.id, status, job.job_type, job.next_run_at
+                job.id, job.status, job.job_type, job.next_run_at
             ))
         });
         self.draw_list(frame, area, items.collect(), "Jobs");
@@ -503,9 +623,9 @@ impl App {
 
     fn draw_search(&self, frame: &mut Frame, area: Rect) {
         let mut items = Vec::new();
-        if self.search_query.is_empty() {
+        if self.input.is_empty() {
             items.push(ListItem::new(
-                "Press / to enter a search query, then Enter.",
+                "Press / to search assistant memory, then Enter.",
             ));
         } else if self.search_results.is_empty() {
             items.push(ListItem::new("No results."));
@@ -517,12 +637,7 @@ impl App {
                 ])
             }));
         }
-        self.draw_list(
-            frame,
-            area,
-            items,
-            &format!("Search: {}", self.search_query),
-        );
+        self.draw_list(frame, area, items, &self.title());
     }
 
     fn draw_list(&self, frame: &mut Frame, area: Rect, items: Vec<ListItem<'_>>, title: &str) {
@@ -539,16 +654,11 @@ impl App {
     }
 }
 
-fn proposal_summary(proposal: &MemoryExtractionProposal) -> String {
-    let value: serde_json::Value = match serde_json::from_str(&proposal.payload_json) {
-        Ok(value) => value,
-        Err(_) => return "invalid proposal JSON".to_string(),
-    };
-    let items = value
-        .get("items")
-        .and_then(|value| value.as_array())
-        .map_or(0, Vec::len);
-    format!("{} item(s), turn {}", items, proposal.conversation_turn_id)
+fn unexpected_response(method: &str, response: ResponsePayload) -> IpcClientError {
+    IpcClientError::Server {
+        code: "unexpected_response".to_string(),
+        message: format!("Unexpected response for {method}: {response:?}"),
+    }
 }
 
 fn compact(value: &str, limit: usize) -> String {
@@ -562,6 +672,10 @@ fn compact(value: &str, limit: usize) -> String {
             chars[..limit.saturating_sub(1)].iter().collect::<String>()
         )
     }
+}
+
+fn compact_json(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string())
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
@@ -596,13 +710,27 @@ mod tests {
     #[test]
     fn tabs_cycle_in_order() {
         assert_eq!(Tab::from_index(0), Tab::Overview);
-        assert_eq!(Tab::from_index(6), Tab::Search);
-        assert_eq!(Tab::from_index(7), Tab::Overview);
+        assert_eq!(Tab::from_index(7), Tab::Search);
+        assert_eq!(Tab::from_index(8), Tab::Overview);
     }
 
     #[test]
     fn compact_collapses_and_truncates_text() {
         assert_eq!(compact("hello   world", 20), "hello world");
         assert_eq!(compact("abcdefghijklmnopqrstuvwxyz", 8), "abcdefg…");
+    }
+
+    #[test]
+    fn app_uses_the_assistant_client_boundary() {
+        let app = App::from_client(
+            IpcClient::new("/tmp/assistant-tui-test.sock"),
+            PathBuf::from("/tmp/assistant-tui-test.sock"),
+        );
+        assert!(app.tasks.is_empty());
+        assert!(app.proposals.is_empty());
+        assert_eq!(
+            app.socket_path,
+            PathBuf::from("/tmp/assistant-tui-test.sock")
+        );
     }
 }

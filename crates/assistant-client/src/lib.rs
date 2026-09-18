@@ -2,6 +2,7 @@ use assistant_protocol::{
     PROTOCOL_VERSION, RequestMethod, ResponsePayload, WireRequest, WireResponse,
 };
 use std::{
+    env,
     error::Error,
     fmt,
     io::{BufRead, BufReader, Write},
@@ -17,6 +18,19 @@ pub struct IpcClient {
     socket_path: PathBuf,
     timeout: Duration,
     next_id: AtomicU64,
+}
+
+pub fn default_socket_path() -> Result<PathBuf, Box<dyn Error>> {
+    if let Some(value) = env::var_os("ASSISTANT_SOCKET_PATH") {
+        return Ok(PathBuf::from(value));
+    }
+
+    if let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR") {
+        return Ok(PathBuf::from(runtime_dir).join("assistant.sock"));
+    }
+
+    let home = env::var_os("HOME").ok_or("HOME environment variable is not set.")?;
+    Ok(PathBuf::from(home).join(".cache/assistant/assistant.sock"))
 }
 
 impl IpcClient {
