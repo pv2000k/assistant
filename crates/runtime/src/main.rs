@@ -52,7 +52,7 @@ impl ModelSession {
             "qwen".to_string(),
             LocalModelDefinition {
                 id: "qwen".to_string(),
-                display_name: "Qwen3.5 4B".to_string(),
+                display_name: qwen_model.to_string(),
                 base_url: qwen_url.to_string(),
                 model: qwen_model.to_string(),
                 capabilities: vec!["controller".to_string(), "general_response".to_string()],
@@ -2679,6 +2679,20 @@ mod session_tests {
         let address = listener.local_addr()?;
         drop(listener);
         Ok(format!("http://{address}"))
+    }
+
+    #[test]
+    fn qwen_environment_model_is_used_as_display_name() -> Result<(), Box<dyn Error>> {
+        let session = ModelSession::from_environment(
+            "http://127.0.0.1:18080",
+            "Mistral-7B-Instruct-v0.3.gguf",
+        )?;
+
+        let definition = session.active_definition()?;
+        assert_eq!(definition.id, "qwen");
+        assert_eq!(definition.model, "Mistral-7B-Instruct-v0.3.gguf");
+        assert_eq!(definition.display_name, "Mistral-7B-Instruct-v0.3.gguf");
+        Ok(())
     }
 
     #[test]

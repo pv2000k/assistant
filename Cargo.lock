@@ -50,11 +50,11 @@ dependencies = [
 name = "assistant-tui"
 version = "0.1.0"
 dependencies = [
+ "assistant-client",
+ "assistant-protocol",
  "crossterm",
- "orchestrator",
  "ratatui",
  "serde_json",
- "sqlite-memory",
 ]
 
 [[package]]

@@ -1,4 +1,11 @@
+mod startup;
+
 use std::{error::Error, io, path::PathBuf, time::Duration};
+
+use startup::{
+    ModelChoice, RuntimeLaunch, discover_models, initial_model_index, probe_runtime,
+    runtime_binary_path,
+};
 
 use assistant_client::{IpcClient, IpcClientError, default_socket_path};
 use assistant_protocol::{
@@ -679,24 +686,153 @@ fn compact_json(value: &serde_json::Value) -> String {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let mut app = App::new()?;
+    let models = discover_models()?;
+    let socket_path = default_socket_path()?;
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = loop {
-        terminal.draw(|frame| app.draw(frame))?;
-        if event::poll(Duration::from_millis(250))? && !app.handle_event(event::read()?)? {
-            break Ok(());
+    let startup_result = run_startup(&mut terminal, &socket_path, &models);
+    let result = match startup_result {
+        Ok(StartupOutcome::Continue) => {
+            let mut app = App::new()?;
+            loop {
+                terminal.draw(|frame| app.draw(frame))?;
+                if event::poll(Duration::from_millis(250))? && !app.handle_event(event::read()?)? {
+                    break Ok(());
+                }
+            }
         }
+        Ok(StartupOutcome::Quit) => Ok(()),
+        Err(error) => Err(error),
     };
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupOutcome {
+    Continue,
+    Quit,
+}
+
+fn run_startup(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    socket_path: &std::path::Path,
+    models: &[ModelChoice],
+) -> Result<StartupOutcome, Box<dyn Error>> {
+    let runtime = probe_runtime(socket_path);
+    let mut selected = initial_model_index(models);
+
+    loop {
+        terminal.draw(|frame| draw_startup(frame, models, selected, runtime.as_ref()))?;
+
+        if !event::poll(Duration::from_millis(250))? {
+            continue;
+        }
+
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(StartupOutcome::Quit),
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1).min(models.len().saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                if let Some(runtime) = runtime.as_ref() {
+                    let _ = runtime;
+                    return Ok(StartupOutcome::Continue);
+                }
+
+                let model = models
+                    .get(selected)
+                    .ok_or("No model is selected at startup.")?;
+                let runtime_bin = runtime_binary_path()?;
+                let mut launcher = RuntimeLaunch::new(&runtime_bin, socket_path, model)?;
+                launcher.wait_until_ready(socket_path)?;
+                return Ok(StartupOutcome::Continue);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn draw_startup(
+    frame: &mut Frame,
+    models: &[ModelChoice],
+    selected: usize,
+    runtime: Option<&startup::RuntimeStatus>,
+) {
+    let area = frame.area();
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    let header = if let Some(runtime) = runtime {
+        vec![
+            Line::from("PERSONAL ASSISTANT"),
+            Line::from("Runtime already active."),
+            Line::from(format!(
+                "Active model: {} ({})",
+                runtime.model_display_name, runtime.active_model_id
+            )),
+        ]
+    } else {
+        vec![
+            Line::from("PERSONAL ASSISTANT"),
+            Line::from("Choose the model to load for this runtime session."),
+            Line::from("The embedding model is managed separately by the runtime."),
+        ]
+    };
+
+    frame.render_widget(
+        Paragraph::new(header)
+            .block(Block::default().borders(Borders::ALL).title("Startup"))
+            .wrap(Wrap { trim: true }),
+        vertical[0],
+    );
+
+    let items = models.iter().enumerate().map(|(index, model)| {
+        let marker = if index == selected { ">" } else { " " };
+        ListItem::new(format!("{marker} {:>2}. {}", index + 1, model.filename))
+    });
+    let list = List::new(items.collect::<Vec<_>>())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Available local models"),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    frame.render_widget(list, vertical[1]);
+
+    let footer = if runtime.is_some() {
+        "↑↓ select | Enter continue with active runtime | q quit"
+    } else {
+        "↑↓ select | Enter launch runtime | q quit"
+    };
+    frame.render_widget(
+        Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
+        vertical[2],
+    );
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
