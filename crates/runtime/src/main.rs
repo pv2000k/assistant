@@ -1,4 +1,5 @@
 mod ipc;
+mod lifecycle;
 mod process_supervisor;
 
 use assistant_protocol::{
@@ -6,6 +7,7 @@ use assistant_protocol::{
     ModelList, ModelState, ReminderList, RequestMethod, ResponsePayload, TaskList, WireRequest,
     WireResponse,
 };
+use lifecycle::RuntimeLifecycle;
 use model_router::ModelRouter;
 use orchestrator::{
     ApprovalHandler, Controller, HybridMemory, IndexedToolExecutor, LlamaCppController, Memory,
@@ -281,6 +283,7 @@ struct RuntimeIpcHandler {
     orchestrator: Arc<Mutex<RuntimeOrchestrator>>,
     indexer: PersistentMemoryIndexer,
     _local_services: Arc<Mutex<LocalServiceSupervisor>>,
+    lifecycle: Arc<RuntimeLifecycle>,
 }
 
 impl RuntimeIpcHandler {
@@ -527,6 +530,45 @@ impl RuntimeIpcHandler {
         }
     }
 
+    fn handle_client_acquire(&self, id: u64, client_id: String) -> WireResponse {
+        match self.lifecycle.acquire(&client_id) {
+            Ok(active_clients) => WireResponse::ok(
+                id,
+                ResponsePayload::Lease(assistant_protocol::LeaseStatus {
+                    client_id,
+                    active_clients,
+                }),
+            ),
+            Err(error) => WireResponse::error(id, "client_lease_acquire_failed", error),
+        }
+    }
+
+    fn handle_client_heartbeat(&self, id: u64, client_id: String) -> WireResponse {
+        match self.lifecycle.heartbeat(&client_id) {
+            Ok(active_clients) => WireResponse::ok(
+                id,
+                ResponsePayload::Lease(assistant_protocol::LeaseStatus {
+                    client_id,
+                    active_clients,
+                }),
+            ),
+            Err(error) => WireResponse::error(id, "client_lease_heartbeat_failed", error),
+        }
+    }
+
+    fn handle_client_release(&self, id: u64, client_id: String) -> WireResponse {
+        match self.lifecycle.release(&client_id) {
+            Ok(active_clients) => WireResponse::ok(
+                id,
+                ResponsePayload::Lease(assistant_protocol::LeaseStatus {
+                    client_id,
+                    active_clients,
+                }),
+            ),
+            Err(error) => WireResponse::error(id, "client_lease_release_failed", error),
+        }
+    }
+
     fn handle_reminders_mutate(
         &self,
         id: u64,
@@ -590,6 +632,7 @@ impl RuntimeIpcHandler {
 
 impl ipc::RequestHandler for RuntimeIpcHandler {
     fn handle(&self, request: WireRequest) -> WireResponse {
+        let _request_guard = self.lifecycle.begin_request();
         let id = request.id;
 
         match request.method {
@@ -647,7 +690,30 @@ impl ipc::RequestHandler for RuntimeIpcHandler {
                 body,
                 due,
             } => self.handle_reminders_mutate(id, operation, item_id, title, body, due),
+            RequestMethod::ClientAcquire { client_id } => self.handle_client_acquire(id, client_id),
+            RequestMethod::ClientHeartbeat { client_id } => {
+                self.handle_client_heartbeat(id, client_id)
+            }
+            RequestMethod::ClientRelease { client_id } => self.handle_client_release(id, client_id),
         }
+    }
+
+    fn should_shutdown(&self) -> bool {
+        let background_work_active = self
+            .orchestrator
+            .lock()
+            .ok()
+            .and_then(|orchestrator| {
+                orchestrator
+                    .memory
+                    .database()
+                    .jobs(Some("running"), 1000)
+                    .ok()
+                    .map(|jobs| !jobs.is_empty())
+            })
+            .unwrap_or(true);
+
+        self.lifecycle.should_shutdown(background_work_active)
     }
 }
 
@@ -1467,11 +1533,18 @@ fn print_client_response(response: ResponsePayload) {
             println!("{} {} succeeded:", mutation.tool, mutation.operation);
             println!("{}", mutation.output);
         }
+        ResponsePayload::Lease(lease) => {
+            println!(
+                "Client lease {} | active clients={}",
+                lease.client_id, lease.active_clients
+            );
+        }
     }
 }
 
 fn run_client_mode() -> Result<(), Box<dyn Error>> {
     let socket_path = ipc::default_socket_path()?;
+    let _lease = assistant_client::ClientLease::acquire(&socket_path)?;
     let client = assistant_client::IpcClient::new(&socket_path);
 
     println!("============================================================");
@@ -1831,11 +1904,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
 
     if daemon_mode {
+        let lifecycle = Arc::new(RuntimeLifecycle::from_environment()?);
         let handler = Arc::new(RuntimeIpcHandler {
             model_session: model_session.clone(),
             orchestrator: Arc::new(Mutex::new(orchestrator)),
             indexer: indexer.clone(),
             _local_services: Arc::new(Mutex::new(local_services)),
+            lifecycle,
         });
         let socket_path = ipc::default_socket_path()?;
         ipc::serve(&socket_path, handler)

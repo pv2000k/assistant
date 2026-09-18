@@ -108,6 +108,15 @@ pub enum RequestMethod {
         )]
         due: Option<Option<String>>,
     },
+    ClientAcquire {
+        client_id: String,
+    },
+    ClientHeartbeat {
+        client_id: String,
+    },
+    ClientRelease {
+        client_id: String,
+    },
 }
 
 fn deserialize_optional_optional_string<'de, D>(
@@ -180,6 +189,7 @@ pub enum ResponsePayload {
     Proposals(MemoryProposalList),
     Jobs(JobList),
     Mutation(MutationResult),
+    Lease(LeaseStatus),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +297,12 @@ pub struct MutationResult {
     pub tool: String,
     pub operation: String,
     pub output: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseStatus {
+    pub client_id: String,
+    pub active_clients: usize,
 }
 
 #[cfg(test)]
@@ -483,6 +499,39 @@ mod tests {
 
         assert_eq!(WireRequest::decode_line(&accept.encode_line()?)?, accept);
         assert_eq!(WireRequest::decode_line(&reject.encode_line()?)?, reject);
+        Ok(())
+    }
+
+    #[test]
+    fn client_lease_requests_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let requests = [
+            RequestMethod::ClientAcquire {
+                client_id: "tui-1".to_string(),
+            },
+            RequestMethod::ClientHeartbeat {
+                client_id: "tui-1".to_string(),
+            },
+            RequestMethod::ClientRelease {
+                client_id: "tui-1".to_string(),
+            },
+        ];
+
+        for request in requests {
+            let wire = WireRequest::new(99, request.clone());
+            assert_eq!(WireRequest::decode_line(&wire.encode_line()?)?, wire);
+        }
+
+        let response = WireResponse::ok(
+            100,
+            ResponsePayload::Lease(LeaseStatus {
+                client_id: "tui-1".to_string(),
+                active_clients: 1,
+            }),
+        );
+        assert_eq!(
+            WireResponse::decode_line(&response.encode_line()?)?,
+            response
+        );
         Ok(())
     }
 

@@ -10,10 +10,16 @@ use std::{
     },
     path::Path,
     sync::Arc,
+    thread,
+    time::Duration,
 };
 
 pub trait RequestHandler: Send + Sync + 'static {
     fn handle(&self, request: WireRequest) -> WireResponse;
+
+    fn should_shutdown(&self) -> bool {
+        false
+    }
 }
 
 pub fn serve<H>(socket_path: &Path, handler: Arc<H>) -> Result<(), Box<dyn Error + Send + Sync>>
@@ -37,12 +43,18 @@ where
     }
 
     let listener = UnixListener::bind(socket_path)?;
+    listener.set_nonblocking(true)?;
     println!("IPC socket: {}", socket_path.display());
     println!("Runtime daemon is ready.");
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    loop {
+        if handler.should_shutdown() {
+            println!("Runtime idle timeout reached; shutting down.");
+            break;
+        }
+
+        match listener.accept() {
+            Ok((stream, _)) => {
                 let handler = Arc::clone(&handler);
                 std::thread::spawn(move || {
                     if let Err(error) = handle_connection(stream, handler) {
@@ -50,10 +62,14 @@ where
                     }
                 });
             }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(100));
+            }
             Err(error) => eprintln!("IPC accept failed: {error}"),
         }
     }
 
+    let _ = fs::remove_file(socket_path);
     Ok(())
 }
 
@@ -97,6 +113,31 @@ mod tests {
                 _ => WireResponse::error(request.id, "unsupported", "unsupported in test"),
             }
         }
+    }
+
+    struct ShutdownHandler;
+
+    impl RequestHandler for ShutdownHandler {
+        fn handle(&self, request: WireRequest) -> WireResponse {
+            WireResponse::error(request.id, "unused", "unused")
+        }
+
+        fn should_shutdown(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn serve_exits_when_handler_requests_shutdown() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let directory = tempfile::tempdir()?;
+        let socket_path = directory.path().join("assistant.sock");
+        let handler = Arc::new(ShutdownHandler);
+        let socket_for_thread = socket_path.clone();
+        let thread = std::thread::spawn(move || serve(&socket_for_thread, handler));
+
+        thread.join().map_err(|_| "IPC server thread panicked.")??;
+        assert!(!socket_path.exists());
+        Ok(())
     }
 
     #[test]

@@ -118,13 +118,15 @@ impl BackgroundWorkers {
 
     pub fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        self.handles.clear();
+        for handle in std::mem::take(&mut self.handles) {
+            let _ = handle.join();
+        }
     }
 }
 
 impl Drop for BackgroundWorkers {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.shutdown();
     }
 }
 
@@ -135,5 +137,33 @@ fn wait_or_stop(stop: &AtomicBool, duration: Duration) {
             return;
         }
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn shutdown_signals_and_joins_worker_threads() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            done_tx.send(()).expect("send worker completion");
+        });
+
+        let mut workers = BackgroundWorkers {
+            stop,
+            handles: vec![handle],
+        };
+        workers.shutdown();
+
+        assert!(workers.handles.is_empty());
+        assert!(done_rx.try_recv().is_ok());
     }
 }

@@ -8,11 +8,18 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+const LEASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct IpcClient {
     socket_path: PathBuf,
@@ -64,6 +71,46 @@ impl IpcClient {
         response.result.ok_or(IpcClientError::MissingResult)
     }
 
+    pub fn acquire_lease(
+        &self,
+        client_id: &str,
+    ) -> Result<assistant_protocol::LeaseStatus, IpcClientError> {
+        self.expect_lease(RequestMethod::ClientAcquire {
+            client_id: client_id.to_string(),
+        })
+    }
+
+    pub fn heartbeat_lease(
+        &self,
+        client_id: &str,
+    ) -> Result<assistant_protocol::LeaseStatus, IpcClientError> {
+        self.expect_lease(RequestMethod::ClientHeartbeat {
+            client_id: client_id.to_string(),
+        })
+    }
+
+    pub fn release_lease(
+        &self,
+        client_id: &str,
+    ) -> Result<assistant_protocol::LeaseStatus, IpcClientError> {
+        self.expect_lease(RequestMethod::ClientRelease {
+            client_id: client_id.to_string(),
+        })
+    }
+
+    fn expect_lease(
+        &self,
+        method: RequestMethod,
+    ) -> Result<assistant_protocol::LeaseStatus, IpcClientError> {
+        match self.request(method)? {
+            ResponsePayload::Lease(status) => Ok(status),
+            other => Err(IpcClientError::Server {
+                code: "unexpected_response".to_string(),
+                message: format!("Expected lease response, received {other:?}."),
+            }),
+        }
+    }
+
     pub fn request_wire(&self, method: RequestMethod) -> Result<WireResponse, IpcClientError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = WireRequest::new(id, method);
@@ -101,6 +148,81 @@ impl IpcClient {
         }
 
         Ok(response)
+    }
+}
+
+pub struct ClientLease {
+    socket_path: PathBuf,
+    client_id: String,
+    stop: Arc<AtomicBool>,
+    heartbeat: Option<JoinHandle<()>>,
+}
+
+impl ClientLease {
+    pub fn acquire(socket_path: impl Into<PathBuf>) -> Result<Self, IpcClientError> {
+        let socket_path = socket_path.into();
+        let client_id = format!(
+            "client-{}-{}",
+            std::process::id(),
+            NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed)
+        );
+
+        let client = IpcClient::new(&socket_path).with_timeout(LEASE_REQUEST_TIMEOUT);
+        client.acquire_lease(&client_id)?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let heartbeat_stop = Arc::clone(&stop);
+        let heartbeat_socket = socket_path.clone();
+        let heartbeat_id = client_id.clone();
+        let heartbeat = match thread::Builder::new()
+            .name("assistant-ipc-lease-heartbeat".to_string())
+            .spawn(move || {
+                let client = IpcClient::new(&heartbeat_socket).with_timeout(LEASE_REQUEST_TIMEOUT);
+                while !heartbeat_stop.load(Ordering::Relaxed) {
+                    let slices = LEASE_HEARTBEAT_INTERVAL.as_millis().div_ceil(100).max(1);
+                    for _ in 0..slices {
+                        if heartbeat_stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+
+                    if heartbeat_stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+
+                    let _ = client.heartbeat_lease(&heartbeat_id);
+                }
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = client.release_lease(&client_id);
+                return Err(IpcClientError::Io(error));
+            }
+        };
+
+        Ok(Self {
+            socket_path,
+            client_id,
+            stop,
+            heartbeat: Some(heartbeat),
+        })
+    }
+
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+}
+
+impl Drop for ClientLease {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.heartbeat.take() {
+            let _ = handle.join();
+        }
+
+        let client = IpcClient::new(&self.socket_path).with_timeout(LEASE_REQUEST_TIMEOUT);
+        let _ = client.release_lease(&self.client_id);
     }
 }
 
@@ -293,6 +415,91 @@ mod tests {
             .join()
             .expect("server thread joins")
             .expect("server succeeds");
+    }
+
+    #[test]
+    fn client_lease_acquires_and_releases_over_ipc() {
+        let (_directory, socket_path) = test_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+        let socket_for_thread = socket_path.clone();
+        let server = thread::spawn(move || -> Result<(), String> {
+            for expected_method in [
+                RequestMethod::ClientAcquire {
+                    client_id: String::new(),
+                },
+                RequestMethod::ClientRelease {
+                    client_id: String::new(),
+                },
+            ] {
+                let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+                let mut request_line = String::new();
+                BufReader::new(stream.try_clone().map_err(|error| error.to_string())?)
+                    .read_line(&mut request_line)
+                    .map_err(|error| error.to_string())?;
+                let request =
+                    WireRequest::decode_line(&request_line).map_err(|error| error.to_string())?;
+                match (expected_method, request.method) {
+                    (
+                        RequestMethod::ClientAcquire { .. },
+                        RequestMethod::ClientAcquire { client_id },
+                    )
+                    | (
+                        RequestMethod::ClientRelease { .. },
+                        RequestMethod::ClientRelease { client_id },
+                    ) => {
+                        let response = WireResponse::ok(
+                            request.id,
+                            ResponsePayload::Lease(assistant_protocol::LeaseStatus {
+                                client_id,
+                                active_clients: 1,
+                            }),
+                        );
+                        stream
+                            .write_all(
+                                response
+                                    .encode_line()
+                                    .map_err(|error| error.to_string())?
+                                    .as_bytes(),
+                            )
+                            .map_err(|error| error.to_string())?;
+                        stream.flush().map_err(|error| error.to_string())?;
+                    }
+                    (_, method) => {
+                        return Err(format!("unexpected IPC lease method: {method:?}"));
+                    }
+                }
+            }
+            Ok(())
+        });
+
+        let lease = ClientLease::acquire(&socket_for_thread).expect("lease acquisition succeeds");
+        assert!(
+            lease
+                .client_id()
+                .starts_with(&format!("client-{}-", std::process::id()))
+        );
+        drop(lease);
+
+        server
+            .join()
+            .expect("server thread joins")
+            .expect("server succeeds");
+    }
+
+    #[test]
+    fn client_lease_ids_are_non_empty_and_process_scoped() {
+        let first = format!(
+            "client-{}-{}",
+            std::process::id(),
+            NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let second = format!(
+            "client-{}-{}",
+            std::process::id(),
+            NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        assert!(!first.is_empty());
+        assert_ne!(first, second);
     }
 
     #[test]

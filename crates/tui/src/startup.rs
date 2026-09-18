@@ -91,7 +91,6 @@ impl RuntimeLaunch {
 
             if let Some(runtime) = probe_runtime_with_client(&client) {
                 if runtime.health.ready && runtime.model_status.ready {
-                    self.detach_on_drop = true;
                     return Ok(());
                 }
             }
@@ -102,6 +101,10 @@ impl RuntimeLaunch {
         let _ = self.child.kill();
         let _ = self.child.wait();
         Err("Timed out waiting for assistant runtime to become ready.".into())
+    }
+
+    pub fn detach(&mut self) {
+        self.detach_on_drop = true;
     }
 }
 

@@ -7,7 +7,7 @@ use startup::{
     runtime_binary_path,
 };
 
-use assistant_client::{IpcClient, IpcClientError, default_socket_path};
+use assistant_client::{ClientLease, IpcClient, IpcClientError, default_socket_path};
 use assistant_protocol::{
     ChatResponse, HealthStatus, JobSummary, MemoryProposalSummary, ModelInfo, ModelState,
     ReminderSummary, RequestMethod, ResponsePayload, TaskSummary,
@@ -697,7 +697,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let startup_result = run_startup(&mut terminal, &socket_path, &models);
     let result = match startup_result {
-        Ok(StartupOutcome::Continue) => {
+        Ok(StartupOutcome::Continue(_lease)) => {
             let mut app = App::new()?;
             loop {
                 terminal.draw(|frame| app.draw(frame))?;
@@ -716,9 +716,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     result
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupOutcome {
-    Continue,
+    Continue(ClientLease),
     Quit,
 }
 
@@ -753,9 +752,9 @@ fn run_startup(
                 selected = (selected + 1).min(models.len().saturating_sub(1));
             }
             KeyCode::Enter => {
-                if let Some(runtime) = runtime.as_ref() {
-                    let _ = runtime;
-                    return Ok(StartupOutcome::Continue);
+                if runtime.is_some() {
+                    let lease = ClientLease::acquire(socket_path)?;
+                    return Ok(StartupOutcome::Continue(lease));
                 }
 
                 let model = models
@@ -764,7 +763,9 @@ fn run_startup(
                 let runtime_bin = runtime_binary_path()?;
                 let mut launcher = RuntimeLaunch::new(&runtime_bin, socket_path, model)?;
                 launcher.wait_until_ready(socket_path)?;
-                return Ok(StartupOutcome::Continue);
+                let lease = ClientLease::acquire(socket_path)?;
+                launcher.detach();
+                return Ok(StartupOutcome::Continue(lease));
             }
             _ => {}
         }
