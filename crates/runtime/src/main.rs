@@ -480,6 +480,66 @@ impl RuntimeIpcHandler {
             Err(error) => WireResponse::error(id, "task_mutation_failed", error.to_string()),
         }
     }
+
+    fn handle_reminders_mutate(
+        &self,
+        id: u64,
+        operation: String,
+        item_id: Option<String>,
+        title: Option<String>,
+        body: Option<String>,
+        due: Option<Option<String>>,
+    ) -> WireResponse {
+        // Direct IPC mutations are explicit client/user actions.
+        // Model-originated reminders.mutate calls remain approval-gated by the orchestrator.
+        let operation_for_response = operation.clone();
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(
+            "operation".to_string(),
+            serde_json::Value::String(operation.clone()),
+        );
+
+        if let Some(item_id) = item_id {
+            arguments.insert("id".to_string(), serde_json::Value::String(item_id));
+        }
+
+        if let Some(title) = title {
+            arguments.insert("title".to_string(), serde_json::Value::String(title));
+        }
+
+        if let Some(body) = body {
+            arguments.insert("body".to_string(), serde_json::Value::String(body));
+        }
+
+        if let Some(due) = due {
+            arguments.insert(
+                "due".to_string(),
+                due.map_or(serde_json::Value::Null, serde_json::Value::String),
+            );
+        }
+
+        let arguments = serde_json::Value::Object(arguments);
+
+        match self.with_orchestrator(|orchestrator| {
+            let result = orchestrator.tools.execute(&ToolCall {
+                tool: "reminders.mutate".to_string(),
+                arguments,
+            })?;
+
+            if !result.success {
+                return Err(format!("Reminder mutation tool failed: {}", result.output).into());
+            }
+
+            Ok(assistant_protocol::MutationResult {
+                tool: "reminders.mutate".to_string(),
+                operation: operation_for_response,
+                output: result.output,
+            })
+        }) {
+            Ok(result) => WireResponse::ok(id, ResponsePayload::Mutation(result)),
+            Err(error) => WireResponse::error(id, "reminder_mutation_failed", error.to_string()),
+        }
+    }
 }
 
 impl ipc::RequestHandler for RuntimeIpcHandler {
@@ -528,6 +588,13 @@ impl ipc::RequestHandler for RuntimeIpcHandler {
                 due,
                 status,
             } => self.handle_tasks_mutate(id, operation, item_id, title, body, due, status),
+            RequestMethod::RemindersMutate {
+                operation,
+                id: item_id,
+                title,
+                body,
+                due,
+            } => self.handle_reminders_mutate(id, operation, item_id, title, body, due),
         }
     }
 }
@@ -939,6 +1006,13 @@ enum ClientCommand {
         due: Option<Option<String>>,
         status: Option<String>,
     },
+    ReminderMutation {
+        operation: String,
+        id: Option<String>,
+        title: Option<String>,
+        body: Option<String>,
+        due: Option<Option<String>>,
+    },
     Quit,
 }
 
@@ -1035,6 +1109,97 @@ fn parse_task_mutation_command(text: &str) -> Result<ClientCommand, String> {
     }
 }
 
+fn parse_reminder_mutation_command(text: &str) -> Result<ClientCommand, String> {
+    let remainder = text.strip_prefix(":reminder ").unwrap_or("").trim();
+    let mut parts = remainder.splitn(2, ' ');
+    let operation = parts.next().unwrap_or("");
+    let arguments = parts.next().unwrap_or("").trim();
+
+    match operation {
+        "create" => {
+            if arguments.is_empty() {
+                return Err("Usage: :reminder create <title> [due=<value>]".to_string());
+            }
+
+            let (title, due) = if let Some((title, due)) = arguments.rsplit_once(" due=") {
+                let title = title.trim();
+                let due = due.trim();
+                if title.is_empty() || due.is_empty() {
+                    return Err("Usage: :reminder create <title> [due=<value>]".to_string());
+                }
+                (title.to_string(), Some(Some(due.to_string())))
+            } else {
+                (arguments.to_string(), None)
+            };
+
+            Ok(ClientCommand::ReminderMutation {
+                operation: "create".to_string(),
+                id: None,
+                title: Some(title),
+                body: None,
+                due,
+            })
+        }
+        "cancel" => {
+            if arguments.is_empty() || arguments.contains(char::is_whitespace) {
+                Err("Usage: :reminder cancel <id>".to_string())
+            } else {
+                Ok(ClientCommand::ReminderMutation {
+                    operation: "cancel".to_string(),
+                    id: Some(arguments.to_string()),
+                    title: None,
+                    body: None,
+                    due: None,
+                })
+            }
+        }
+        "update" => {
+            let mut parts = arguments.splitn(2, ' ');
+            let id = parts.next().unwrap_or("").trim();
+            let assignment = parts.next().unwrap_or("").trim();
+            if id.is_empty() || assignment.is_empty() {
+                return Err("Usage: :reminder update <id> <field>=<value>".to_string());
+            }
+
+            let (field, value) = assignment
+                .split_once('=')
+                .ok_or_else(|| "Usage: :reminder update <id> <field>=<value>".to_string())?;
+            let field = field.trim().to_ascii_lowercase();
+            let value = value.trim();
+
+            match field.as_str() {
+                "title" => Ok(ClientCommand::ReminderMutation {
+                    operation: "update".to_string(),
+                    id: Some(id.to_string()),
+                    title: Some(value.to_string()),
+                    body: None,
+                    due: None,
+                }),
+                "body" => Ok(ClientCommand::ReminderMutation {
+                    operation: "update".to_string(),
+                    id: Some(id.to_string()),
+                    title: None,
+                    body: Some(value.to_string()),
+                    due: None,
+                }),
+                "due" => Ok(ClientCommand::ReminderMutation {
+                    operation: "update".to_string(),
+                    id: Some(id.to_string()),
+                    title: None,
+                    body: None,
+                    due: Some(if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    }),
+                }),
+                _ => Err("Reminder update fields: title, body, due".to_string()),
+            }
+        }
+        _ => Err("Reminder operations: create, update, cancel".to_string()),
+    }
+}
+
 fn parse_client_command(text: &str) -> Result<ClientCommand, String> {
     let text = text.trim();
     match text {
@@ -1049,7 +1214,9 @@ fn parse_client_command(text: &str) -> Result<ClientCommand, String> {
         ":memory-proposals" => Ok(ClientCommand::MemoryProposals),
         ":jobs" => Ok(ClientCommand::Jobs(None)),
         ":task" => Err("Usage: :task [create|update|complete|cancel] ...".to_string()),
+        ":reminder" => Err("Usage: :reminder [create|update|cancel] ...".to_string()),
         _ if text.starts_with(":task ") => parse_task_mutation_command(text),
+        _ if text.starts_with(":reminder ") => parse_reminder_mutation_command(text),
         _ if text.starts_with(":chat ") => {
             let message = text.strip_prefix(":chat ").unwrap_or("").trim();
             if message.is_empty() {
@@ -1103,7 +1270,7 @@ fn parse_client_command(text: &str) -> Result<ClientCommand, String> {
         }
         _ if !text.starts_with(':') => Ok(ClientCommand::Chat(text.to_string())),
         _ => Err(
-            "Client commands: plain text, :chat <text>, :ping, :health, :model [list|status|use <id>], :tasks [status], :reminders [status], :memory search <query>, :memory-proposals, :jobs [status], :quit"
+            "Client commands: plain text, :chat <text>, :ping, :health, :model [list|status|use <id>], :tasks [status], :reminders [status], :memory search <query>, :memory-proposals, :jobs [status], :task [create|update|complete|cancel] ..., :reminder [create|update|cancel] ..., :quit"
                 .to_string(),
         ),
     }
@@ -1240,7 +1407,7 @@ fn run_client_mode() -> Result<(), Box<dyn Error>> {
     println!("============================================================");
     println!("Runtime socket: {}", socket_path.display());
     println!(
-        "Commands: plain text or :chat <text>, :ping, :health, :model [list|status|use <id>], :tasks [status], :reminders [status], :memory search <query>, :memory-proposals, :jobs [status], :task [create|update|complete|cancel] ..., :quit"
+        "Commands: plain text or :chat <text>, :ping, :health, :model [list|status|use <id>], :tasks [status], :reminders [status], :memory search <query>, :memory-proposals, :jobs [status], :task [create|update|complete|cancel] ..., :reminder [create|update|cancel] ..., :quit"
     );
     println!("============================================================");
     println!();
@@ -1310,6 +1477,19 @@ fn run_client_mode() -> Result<(), Box<dyn Error>> {
                 body,
                 due,
                 status,
+            },
+            ClientCommand::ReminderMutation {
+                operation,
+                id,
+                title,
+                body,
+                due,
+            } => RequestMethod::RemindersMutate {
+                operation,
+                id,
+                title,
+                body,
+                due,
             },
             ClientCommand::Quit => unreachable!(),
         };
@@ -2054,6 +2234,48 @@ mod session_tests {
                 status: None,
             })
         );
+    }
+
+    #[test]
+    fn client_command_parser_accepts_reminder_mutation_commands() {
+        assert_eq!(
+            parse_client_command(":reminder create Review RCM report due=tomorrow at 6 PM"),
+            Ok(ClientCommand::ReminderMutation {
+                operation: "create".to_string(),
+                id: None,
+                title: Some("Review RCM report".to_string()),
+                body: None,
+                due: Some(Some("tomorrow at 6 PM".to_string())),
+            })
+        );
+        assert_eq!(
+            parse_client_command(":reminder update reminder:review-rcm due="),
+            Ok(ClientCommand::ReminderMutation {
+                operation: "update".to_string(),
+                id: Some("reminder:review-rcm".to_string()),
+                title: None,
+                body: None,
+                due: Some(None),
+            })
+        );
+        assert_eq!(
+            parse_client_command(":reminder cancel reminder:review-rcm"),
+            Ok(ClientCommand::ReminderMutation {
+                operation: "cancel".to_string(),
+                id: Some("reminder:review-rcm".to_string()),
+                title: None,
+                body: None,
+                due: None,
+            })
+        );
+    }
+
+    #[test]
+    fn client_command_parser_rejects_invalid_reminder_mutations() {
+        assert!(parse_client_command(":reminder").is_err());
+        assert!(parse_client_command(":reminder cancel").is_err());
+        assert!(parse_client_command(":reminder update reminder:foo color=red").is_err());
+        assert!(parse_client_command(":reminder create Follow up due=").is_err());
     }
 
     #[test]

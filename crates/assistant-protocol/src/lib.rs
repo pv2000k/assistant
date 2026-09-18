@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const DEFAULT_LIST_LIMIT: usize = 100;
@@ -78,11 +78,39 @@ pub enum RequestMethod {
         title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         body: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_optional_optional_string"
+        )]
         due: Option<Option<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
+    RemindersMutate {
+        operation: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_optional_optional_string"
+        )]
+        due: Option<Option<String>>,
+    },
+}
+
+fn deserialize_optional_optional_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Some(Option::<String>::deserialize(deserializer)?))
 }
 
 impl RequestMethod {
@@ -354,6 +382,81 @@ mod tests {
                 "due": null
             })
         );
+
+        let decoded = WireRequest::decode_line(&request.encode_line()?)?;
+        assert_eq!(decoded, request);
+        Ok(())
+    }
+
+    #[test]
+    fn reminder_mutation_omits_unset_optional_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let request = WireRequest::new(
+            15,
+            RequestMethod::RemindersMutate {
+                operation: "cancel".to_string(),
+                id: Some("reminder:review-rcm".to_string()),
+                title: None,
+                body: None,
+                due: None,
+            },
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&request.encode_line()?)?;
+        assert_eq!(
+            value["method"]["params"],
+            serde_json::json!({
+                "operation": "cancel",
+                "id": "reminder:review-rcm"
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reminder_mutation_preserves_explicit_null_due() -> Result<(), Box<dyn std::error::Error>> {
+        let request = WireRequest::new(
+            16,
+            RequestMethod::RemindersMutate {
+                operation: "update".to_string(),
+                id: Some("reminder:review-rcm".to_string()),
+                title: None,
+                body: None,
+                due: Some(None),
+            },
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&request.encode_line()?)?;
+        assert_eq!(
+            value["method"]["params"],
+            serde_json::json!({
+                "operation": "update",
+                "id": "reminder:review-rcm",
+                "due": null
+            })
+        );
+
+        let decoded = WireRequest::decode_line(&request.encode_line()?)?;
+        assert_eq!(decoded, request);
+        Ok(())
+    }
+
+    #[test]
+    fn reminder_mutation_request_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let request = WireRequest::new(
+            17,
+            RequestMethod::RemindersMutate {
+                operation: "update".to_string(),
+                id: Some("reminder:review-rcm".to_string()),
+                title: Some("Review RCM report".to_string()),
+                body: Some("Send notes to finance.".to_string()),
+                due: Some(Some("tomorrow at 6 PM".to_string())),
+            },
+        );
+
+        let encoded = request.encode_line()?;
+        let decoded = WireRequest::decode_line(&encoded)?;
+
+        assert_eq!(decoded, request);
         Ok(())
     }
 
