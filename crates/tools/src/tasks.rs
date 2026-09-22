@@ -192,13 +192,24 @@ fn month_from_number(value: u8) -> Result<Month> {
 }
 
 fn parse_date(value: &str) -> Result<Date> {
-    let parts = value.split('-').collect::<Vec<_>>();
+    let separator = if value.contains('/') { '/' } else { '-' };
+    let parts = value.split(separator).collect::<Vec<_>>();
     if parts.len() != 3 {
-        return Err("Date must use YYYY-MM-DD.".into());
+        return Err("Date must use DD/MM/YYYY or YYYY-MM-DD.".into());
     }
-    let year: i32 = parts[0].parse().map_err(|_| "Date year is invalid.")?;
-    let month_number: u8 = parts[1].parse().map_err(|_| "Date month is invalid.")?;
-    let day: u8 = parts[2].parse().map_err(|_| "Date day is invalid.")?;
+
+    let (year, month_number, day) = if separator == '/' {
+        let day: u8 = parts[0].parse().map_err(|_| "Date day is invalid.")?;
+        let month_number: u8 = parts[1].parse().map_err(|_| "Date month is invalid.")?;
+        let year: i32 = parts[2].parse().map_err(|_| "Date year is invalid.")?;
+        (year, month_number, day)
+    } else {
+        let year: i32 = parts[0].parse().map_err(|_| "Date year is invalid.")?;
+        let month_number: u8 = parts[1].parse().map_err(|_| "Date month is invalid.")?;
+        let day: u8 = parts[2].parse().map_err(|_| "Date day is invalid.")?;
+        (year, month_number, day)
+    };
+
     Ok(Date::from_calendar_date(
         year,
         month_from_number(month_number)?,
@@ -1516,6 +1527,30 @@ mod tests {
         let local = OffsetDateTime::parse(&due, &Rfc3339)?.to_offset(local_offset()?);
         assert_eq!(local.date().weekday(), Weekday::Friday);
         assert_eq!(local.time().hour(), 17);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_dd_mm_yyyy_with_time() -> Result<()> {
+        let now = OffsetDateTime::parse("2026-09-13T10:00:00Z", &Rfc3339)?;
+        let due = parse_due_expression("24/09/2026 16:30", now)?;
+        let local = OffsetDateTime::parse(&due, &Rfc3339)?.to_offset(local_offset()?);
+        assert_eq!(local.date().year(), 2026);
+        assert_eq!(local.date().month(), Month::September);
+        assert_eq!(local.date().day(), 24);
+        assert_eq!(local.time().hour(), 16);
+        assert_eq!(local.time().minute(), 30);
+        Ok(())
+    }
+
+    #[test]
+    fn dd_mm_yyyy_defaults_to_nine_am() -> Result<()> {
+        let now = OffsetDateTime::parse("2026-09-13T10:00:00Z", &Rfc3339)?;
+        let due = parse_due_expression("24/09/2026", now)?;
+        let local = OffsetDateTime::parse(&due, &Rfc3339)?.to_offset(local_offset()?);
+        assert_eq!(local.date().day(), 24);
+        assert_eq!(local.time().hour(), 9);
+        assert_eq!(local.time().minute(), 0);
         Ok(())
     }
 

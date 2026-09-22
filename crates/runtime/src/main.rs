@@ -1,15 +1,22 @@
+mod instance_lock;
 mod ipc;
+mod lifecycle;
+mod process_supervisor;
 
 use assistant_protocol::{
     ChatResponse, HealthStatus, JobList, MemoryProposalList, MemorySearchResult, ModelInfo,
     ModelList, ModelState, ReminderList, RequestMethod, ResponsePayload, TaskList, WireRequest,
     WireResponse,
 };
+use instance_lock::RuntimeInstanceLock;
+use lifecycle::RuntimeLifecycle;
 use model_router::ModelRouter;
 use orchestrator::{
     ApprovalHandler, Controller, HybridMemory, IndexedToolExecutor, LlamaCppController, Memory,
-    MemoryIntentMode, MemoryQuery, Orchestrator, PersistentMemoryIndexer, ToolCall, UserRequest,
+    MemoryIntentMode, MemoryQuery, Orchestrator, PersistentMemoryIndexer, ToolCall, ToolExecutor,
+    UserRequest,
 };
+use process_supervisor::LocalServiceSupervisor;
 use sqlite_memory::SqliteMemoryDb;
 use std::{
     collections::HashMap,
@@ -40,6 +47,8 @@ struct LocalModelDefinition {
 struct ModelSession {
     models: Arc<HashMap<String, LocalModelDefinition>>,
     active_model: Arc<RwLock<String>>,
+    model_root: Option<PathBuf>,
+    embedding_model: String,
 }
 
 impl ModelSession {
@@ -49,7 +58,7 @@ impl ModelSession {
             "qwen".to_string(),
             LocalModelDefinition {
                 id: "qwen".to_string(),
-                display_name: "Qwen3.5 4B".to_string(),
+                display_name: qwen_model.to_string(),
                 base_url: qwen_url.to_string(),
                 model: qwen_model.to_string(),
                 capabilities: vec!["controller".to_string(), "general_response".to_string()],
@@ -124,9 +133,19 @@ impl ModelSession {
             }
         }
 
+        let model_root = env::var_os("ASSISTANT_MODEL_ROOT")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join("AI/models")));
+        let embedding_model = env_or_default(
+            "ASSISTANT_EMBEDDING_MODEL",
+            "bge-small-en-v1.5-q8_0.gguf".to_string(),
+        );
+
         Ok(Self {
             models: Arc::new(models),
             active_model: Arc::new(RwLock::new("qwen".to_string())),
+            model_root,
+            embedding_model,
         })
     }
 
@@ -137,10 +156,82 @@ impl ModelSession {
             .map_err(|_| "Active model state lock was poisoned.")?
             .clone();
 
-        self.models
-            .get(&active)
-            .cloned()
-            .ok_or_else(|| format!("Active model '{active}' is not registered.").into())
+        if let Some(definition) = self.models.get(&active) {
+            return Ok(definition.clone());
+        }
+
+        self.dynamic_local_definition(&active)
+    }
+
+    fn dynamic_local_definition(&self, id: &str) -> Result<LocalModelDefinition, Box<dyn Error>> {
+        let filename = id
+            .strip_prefix("local:")
+            .ok_or_else(|| format!("Unknown local model '{id}'."))?;
+
+        let base = self
+            .models
+            .get("qwen")
+            .ok_or("Qwen local model is not registered.")?;
+
+        validate_local_model_filename(filename)?;
+
+        Ok(LocalModelDefinition {
+            id: format!("local:{filename}"),
+            display_name: filename.to_string(),
+            base_url: base.base_url.clone(),
+            model: filename.to_string(),
+            capabilities: base.capabilities.clone(),
+        })
+    }
+
+    fn definition_for_switch(&self, model: &str) -> Result<LocalModelDefinition, Box<dyn Error>> {
+        let requested = model.trim();
+        if requested.is_empty() {
+            return Err("Model id cannot be empty.".into());
+        }
+
+        let normalized = requested.to_ascii_lowercase();
+        if self.models.contains_key(&normalized) {
+            return self
+                .models
+                .get(&normalized)
+                .cloned()
+                .ok_or_else(|| "Registered model disappeared.".into());
+        }
+
+        if self
+            .models
+            .get("qwen")
+            .is_some_and(|qwen| qwen.model == requested)
+        {
+            return self
+                .models
+                .get("qwen")
+                .cloned()
+                .ok_or_else(|| "Qwen model disappeared.".into());
+        }
+
+        let id = if let Some(filename) = requested.strip_prefix("local:") {
+            validate_local_model_filename(filename)?;
+            format!("local:{filename}")
+        } else {
+            validate_local_model_filename(requested)?;
+            format!("local:{requested}")
+        };
+
+        self.dynamic_local_definition(&id)
+    }
+
+    fn activate_model(
+        &self,
+        definition: &LocalModelDefinition,
+    ) -> Result<ModelInfo, Box<dyn Error>> {
+        *self
+            .active_model
+            .write()
+            .map_err(|_| "Active model state lock was poisoned.")? = definition.id.clone();
+
+        self.model_info_with_availability(definition, true)
     }
 
     fn active_model_id(&self) -> Result<String, Box<dyn Error>> {
@@ -152,16 +243,8 @@ impl ModelSession {
     }
 
     fn switch_model(&self, model: &str) -> Result<ModelInfo, Box<dyn Error>> {
-        let normalized = model.trim().to_ascii_lowercase();
-        if normalized.is_empty() {
-            return Err("Model id cannot be empty.".into());
-        }
-
-        let definition = self.models.get(&normalized).ok_or_else(|| {
-            format!("Unknown local model '{normalized}'. Use :model list to see registered models.")
-        })?;
-
-        let available = self.probe_model(definition)?;
+        let definition = self.definition_for_switch(model)?;
+        let available = self.probe_model(&definition)?;
         if !available {
             return Err(format!(
                 "Local model '{}' is unavailable at {}.",
@@ -170,18 +253,11 @@ impl ModelSession {
             .into());
         }
 
-        let mut active = self
-            .active_model
-            .write()
-            .map_err(|_| "Active model state lock was poisoned.")?;
-        *active = definition.id.clone();
-        drop(active);
-
-        self.model_info_with_availability(definition, available)
+        self.activate_model(&definition)
     }
 
-    fn probe_model(&self, definition: &LocalModelDefinition) -> Result<bool, Box<dyn Error>> {
-        let endpoint = format!("{}/v1/models", definition.base_url.trim_end_matches('/'));
+    fn probe_model(&self, _definition: &LocalModelDefinition) -> Result<bool, Box<dyn Error>> {
+        let endpoint = format!("{}/v1/models", _definition.base_url.trim_end_matches('/'));
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(MODEL_PROBE_CONNECT_TIMEOUT)
             .timeout(MODEL_PROBE_TIMEOUT)
@@ -213,15 +289,41 @@ impl ModelSession {
         let definition = self
             .models
             .get(id)
-            .ok_or_else(|| format!("Unknown local model '{id}'."))?;
-        let available = self.probe_model(definition)?;
-        Ok(self.model_info_with_availability(definition, available)?)
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| self.dynamic_local_definition(id))?;
+        let available = self.probe_model(&definition)?;
+        Ok(self.model_info_with_availability(&definition, available)?)
     }
 
     fn list_models(&self) -> Result<Vec<ModelInfo>, Box<dyn Error>> {
         let mut ids = self.models.keys().cloned().collect::<Vec<_>>();
         ids.sort();
-        ids.into_iter().map(|id| self.model_info(&id)).collect()
+
+        let mut models = ids
+            .into_iter()
+            .map(|id| self.model_info(&id))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if let Some(root) = &self.model_root {
+            for filename in discover_generation_model_filenames(root, &self.embedding_model)? {
+                if self
+                    .models
+                    .get("qwen")
+                    .is_some_and(|qwen| qwen.model == filename)
+                {
+                    continue;
+                }
+
+                let id = format!("local:{filename}");
+                let definition = self.dynamic_local_definition(&id)?;
+                let available = self.probe_model(&definition)?;
+                models.push(self.model_info_with_availability(&definition, available)?);
+            }
+        }
+
+        models.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(models)
     }
 
     fn status(&self) -> Result<ModelState, Box<dyn Error>> {
@@ -229,8 +331,10 @@ impl ModelSession {
         let definition = self
             .models
             .get(&active_model)
-            .ok_or_else(|| format!("Active model '{active_model}' is not registered."))?;
-        let ready = self.probe_model(definition)?;
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| self.dynamic_local_definition(&active_model))?;
+        let ready = self.probe_model(&definition)?;
 
         Ok(ModelState {
             active_model: Some(active_model),
@@ -277,6 +381,8 @@ struct RuntimeIpcHandler {
     model_session: ModelSession,
     orchestrator: Arc<Mutex<RuntimeOrchestrator>>,
     indexer: PersistentMemoryIndexer,
+    _local_services: Arc<Mutex<LocalServiceSupervisor>>,
+    lifecycle: Arc<RuntimeLifecycle>,
 }
 
 impl RuntimeIpcHandler {
@@ -399,6 +505,49 @@ impl RuntimeIpcHandler {
         }
     }
 
+    fn handle_memory_proposal_accept(&self, id: u64, proposal_id: String) -> WireResponse {
+        let proposal_id_for_response = proposal_id.clone();
+        match self.indexer.apply_memory_extraction_proposal(&proposal_id) {
+            Ok(paths) => WireResponse::ok(
+                id,
+                ResponsePayload::Mutation(assistant_protocol::MutationResult {
+                    tool: "memory.proposals".to_string(),
+                    operation: "accept".to_string(),
+                    output: serde_json::json!({
+                        "proposal_id": proposal_id_for_response,
+                        "applied": true,
+                        "idempotent": paths.is_empty(),
+                        "paths": paths,
+                    }),
+                }),
+            ),
+            Err(error) => {
+                WireResponse::error(id, "memory_proposal_accept_failed", error.to_string())
+            }
+        }
+    }
+
+    fn handle_memory_proposal_reject(&self, id: u64, proposal_id: String) -> WireResponse {
+        let proposal_id_for_response = proposal_id.clone();
+        match self.indexer.reject_memory_extraction_proposal(&proposal_id) {
+            Ok(rejected) => WireResponse::ok(
+                id,
+                ResponsePayload::Mutation(assistant_protocol::MutationResult {
+                    tool: "memory.proposals".to_string(),
+                    operation: "reject".to_string(),
+                    output: serde_json::json!({
+                        "proposal_id": proposal_id_for_response,
+                        "rejected": rejected,
+                        "idempotent": !rejected,
+                    }),
+                }),
+            ),
+            Err(error) => {
+                WireResponse::error(id, "memory_proposal_reject_failed", error.to_string())
+            }
+        }
+    }
+
     fn handle_jobs(&self, id: u64, status: Option<String>, limit: Option<usize>) -> WireResponse {
         let limit = RequestMethod::list_limit(limit);
         match self.with_orchestrator(|orchestrator| {
@@ -414,10 +563,253 @@ impl RuntimeIpcHandler {
             Err(error) => WireResponse::error(id, "jobs_list_failed", error.to_string()),
         }
     }
+
+    fn handle_tasks_mutate(
+        &self,
+        id: u64,
+        operation: String,
+        item_id: Option<String>,
+        title: Option<String>,
+        body: Option<String>,
+        due: Option<Option<String>>,
+        status: Option<String>,
+    ) -> WireResponse {
+        // Direct IPC mutations are explicit client/user actions.
+        // Model-originated tasks.mutate calls remain approval-gated by the orchestrator.
+        let operation_for_response = operation.clone();
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(
+            "operation".to_string(),
+            serde_json::Value::String(operation.clone()),
+        );
+
+        if let Some(item_id) = item_id {
+            arguments.insert("id".to_string(), serde_json::Value::String(item_id));
+        }
+
+        if let Some(title) = title {
+            arguments.insert("title".to_string(), serde_json::Value::String(title));
+        }
+
+        if let Some(body) = body {
+            arguments.insert("body".to_string(), serde_json::Value::String(body));
+        }
+
+        if let Some(due) = due {
+            arguments.insert(
+                "due".to_string(),
+                due.map_or(serde_json::Value::Null, serde_json::Value::String),
+            );
+        }
+
+        if let Some(status) = status {
+            arguments.insert("status".to_string(), serde_json::Value::String(status));
+        }
+
+        let arguments = serde_json::Value::Object(arguments);
+
+        match self.with_orchestrator(|orchestrator| {
+            let result = orchestrator.tools.execute(&ToolCall {
+                tool: "tasks.mutate".to_string(),
+                arguments,
+            })?;
+
+            if !result.success {
+                return Err(format!("Task mutation tool failed: {}", result.output).into());
+            }
+
+            Ok(assistant_protocol::MutationResult {
+                tool: "tasks.mutate".to_string(),
+                operation: operation_for_response,
+                output: result.output,
+            })
+        }) {
+            Ok(result) => WireResponse::ok(id, ResponsePayload::Mutation(result)),
+            Err(error) => WireResponse::error(id, "task_mutation_failed", error.to_string()),
+        }
+    }
+
+    fn handle_client_acquire(&self, id: u64, client_id: String) -> WireResponse {
+        match self.lifecycle.acquire(&client_id) {
+            Ok(active_clients) => WireResponse::ok(
+                id,
+                ResponsePayload::Lease(assistant_protocol::LeaseStatus {
+                    client_id,
+                    active_clients,
+                }),
+            ),
+            Err(error) => WireResponse::error(id, "client_lease_acquire_failed", error),
+        }
+    }
+
+    fn handle_client_heartbeat(&self, id: u64, client_id: String) -> WireResponse {
+        match self.lifecycle.heartbeat(&client_id) {
+            Ok(active_clients) => WireResponse::ok(
+                id,
+                ResponsePayload::Lease(assistant_protocol::LeaseStatus {
+                    client_id,
+                    active_clients,
+                }),
+            ),
+            Err(error) => WireResponse::error(id, "client_lease_heartbeat_failed", error),
+        }
+    }
+
+    fn handle_client_release(&self, id: u64, client_id: String) -> WireResponse {
+        match self.lifecycle.release(&client_id) {
+            Ok(active_clients) => WireResponse::ok(
+                id,
+                ResponsePayload::Lease(assistant_protocol::LeaseStatus {
+                    client_id,
+                    active_clients,
+                }),
+            ),
+            Err(error) => WireResponse::error(id, "client_lease_release_failed", error),
+        }
+    }
+
+    fn handle_reminders_mutate(
+        &self,
+        id: u64,
+        operation: String,
+        item_id: Option<String>,
+        title: Option<String>,
+        body: Option<String>,
+        due: Option<Option<String>>,
+    ) -> WireResponse {
+        // Direct IPC mutations are explicit client/user actions.
+        // Model-originated reminders.mutate calls remain approval-gated by the orchestrator.
+        let operation_for_response = operation.clone();
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(
+            "operation".to_string(),
+            serde_json::Value::String(operation.clone()),
+        );
+
+        if let Some(item_id) = item_id {
+            arguments.insert("id".to_string(), serde_json::Value::String(item_id));
+        }
+
+        if let Some(title) = title {
+            arguments.insert("title".to_string(), serde_json::Value::String(title));
+        }
+
+        if let Some(body) = body {
+            arguments.insert("body".to_string(), serde_json::Value::String(body));
+        }
+
+        if let Some(due) = due {
+            arguments.insert(
+                "due".to_string(),
+                due.map_or(serde_json::Value::Null, serde_json::Value::String),
+            );
+        }
+
+        let arguments = serde_json::Value::Object(arguments);
+
+        match self.with_orchestrator(|orchestrator| {
+            let result = orchestrator.tools.execute(&ToolCall {
+                tool: "reminders.mutate".to_string(),
+                arguments,
+            })?;
+
+            if !result.success {
+                return Err(format!("Reminder mutation tool failed: {}", result.output).into());
+            }
+
+            Ok(assistant_protocol::MutationResult {
+                tool: "reminders.mutate".to_string(),
+                operation: operation_for_response,
+                output: result.output,
+            })
+        }) {
+            Ok(result) => WireResponse::ok(id, ResponsePayload::Mutation(result)),
+            Err(error) => WireResponse::error(id, "reminder_mutation_failed", error.to_string()),
+        }
+    }
+}
+
+impl RuntimeIpcHandler {
+    fn handle_model_switch(&self, id: u64, model: String) -> WireResponse {
+        let definition = match self.model_session.definition_for_switch(&model) {
+            Ok(definition) => definition,
+            Err(error) => return WireResponse::error(id, "model_switch_failed", error.to_string()),
+        };
+
+        let orchestrator = match self.orchestrator.lock() {
+            Ok(orchestrator) => orchestrator,
+            Err(_) => {
+                return WireResponse::error(
+                    id,
+                    "model_switch_failed",
+                    "Runtime orchestrator state lock was poisoned.",
+                );
+            }
+        };
+
+        let running_background_work = orchestrator
+            .memory
+            .database()
+            .jobs(Some("running"), 1000)
+            .map(|jobs| !jobs.is_empty())
+            .unwrap_or(true);
+        if running_background_work {
+            return WireResponse::error(
+                id,
+                "model_switch_busy",
+                "A background job is currently running. Wait for it to finish before switching the local generation model.",
+            );
+        }
+
+        let qwen_base_url = self
+            .model_session
+            .models
+            .get("qwen")
+            .map(|model| model.base_url.clone())
+            .unwrap_or_default();
+
+        if definition.base_url == qwen_base_url {
+            let mut services = match self._local_services.lock() {
+                Ok(services) => services,
+                Err(_) => {
+                    return WireResponse::error(
+                        id,
+                        "model_switch_failed",
+                        "Local service supervisor state lock was poisoned.",
+                    );
+                }
+            };
+
+            if let Err(error) = services.switch_generation_model(&definition.model) {
+                return WireResponse::error(id, "model_switch_failed", error.to_string());
+            }
+
+            if let Err(error) = orchestrator.models.set_qwen_model(&definition.model) {
+                return WireResponse::error(id, "model_switch_failed", error.to_string());
+            }
+
+            match self.model_session.activate_model(&definition) {
+                Ok(_) => match self.model_session.status() {
+                    Ok(status) => WireResponse::ok(id, ResponsePayload::ModelStatus(status)),
+                    Err(error) => WireResponse::error(id, "model_status_failed", error.to_string()),
+                },
+                Err(error) => WireResponse::error(id, "model_switch_failed", error.to_string()),
+            }
+        } else {
+            match self.model_session.switch_model(&definition.id) {
+                Ok(_) => match self.model_session.status() {
+                    Ok(status) => WireResponse::ok(id, ResponsePayload::ModelStatus(status)),
+                    Err(error) => WireResponse::error(id, "model_status_failed", error.to_string()),
+                },
+                Err(error) => WireResponse::error(id, "model_switch_failed", error.to_string()),
+            }
+        }
+    }
 }
 
 impl ipc::RequestHandler for RuntimeIpcHandler {
     fn handle(&self, request: WireRequest) -> WireResponse {
+        let _request_guard = self.lifecycle.begin_request();
         let id = request.id;
 
         match request.method {
@@ -438,13 +830,7 @@ impl ipc::RequestHandler for RuntimeIpcHandler {
                 Ok(status) => WireResponse::ok(id, ResponsePayload::ModelStatus(status)),
                 Err(error) => WireResponse::error(id, "model_status_failed", error.to_string()),
             },
-            RequestMethod::ModelSwitch { model } => match self.model_session.switch_model(&model) {
-                Ok(_) => match self.model_session.status() {
-                    Ok(status) => WireResponse::ok(id, ResponsePayload::ModelStatus(status)),
-                    Err(error) => WireResponse::error(id, "model_status_failed", error.to_string()),
-                },
-                Err(error) => WireResponse::error(id, "model_switch_failed", error.to_string()),
-            },
+            RequestMethod::ModelSwitch { model } => self.handle_model_switch(id, model),
             RequestMethod::TasksList { status, limit } => self.handle_tasks(id, status, limit),
             RequestMethod::RemindersList { status, limit } => {
                 self.handle_reminders(id, status, limit)
@@ -453,8 +839,52 @@ impl ipc::RequestHandler for RuntimeIpcHandler {
                 self.handle_memory_search(id, query, limit)
             }
             RequestMethod::MemoryProposals { limit } => self.handle_memory_proposals(id, limit),
+            RequestMethod::MemoryProposalAccept { id: proposal_id } => {
+                self.handle_memory_proposal_accept(id, proposal_id)
+            }
+            RequestMethod::MemoryProposalReject { id: proposal_id } => {
+                self.handle_memory_proposal_reject(id, proposal_id)
+            }
             RequestMethod::JobsList { status, limit } => self.handle_jobs(id, status, limit),
+            RequestMethod::TasksMutate {
+                operation,
+                id: item_id,
+                title,
+                body,
+                due,
+                status,
+            } => self.handle_tasks_mutate(id, operation, item_id, title, body, due, status),
+            RequestMethod::RemindersMutate {
+                operation,
+                id: item_id,
+                title,
+                body,
+                due,
+            } => self.handle_reminders_mutate(id, operation, item_id, title, body, due),
+            RequestMethod::ClientAcquire { client_id } => self.handle_client_acquire(id, client_id),
+            RequestMethod::ClientHeartbeat { client_id } => {
+                self.handle_client_heartbeat(id, client_id)
+            }
+            RequestMethod::ClientRelease { client_id } => self.handle_client_release(id, client_id),
         }
+    }
+
+    fn should_shutdown(&self) -> bool {
+        let background_work_active = self
+            .orchestrator
+            .lock()
+            .ok()
+            .and_then(|orchestrator| {
+                orchestrator
+                    .memory
+                    .database()
+                    .jobs(Some("running"), 1000)
+                    .ok()
+                    .map(|jobs| !jobs.is_empty())
+            })
+            .unwrap_or(true);
+
+        self.lifecycle.should_shutdown(background_work_active)
     }
 }
 
@@ -665,8 +1095,11 @@ fn task_summary(record: sqlite_memory::TaskRecord) -> assistant_protocol::TaskSu
     assistant_protocol::TaskSummary {
         id: record.id,
         title: record.title,
+        body: record.body,
         status: record.status,
         due_at: record.due_at,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
     }
 }
 
@@ -674,18 +1107,76 @@ fn reminder_summary(record: sqlite_memory::ReminderRecord) -> assistant_protocol
     assistant_protocol::ReminderSummary {
         id: record.id,
         title: record.title,
+        body: record.body,
         status: record.status,
         due_at: record.due_at,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
     }
 }
 
 fn memory_proposal_summary(
     proposal: sqlite_memory::MemoryExtractionProposal,
 ) -> assistant_protocol::MemoryProposalSummary {
+    let payload = serde_json::from_str::<serde_json::Value>(&proposal.payload_json).ok();
+    let items = payload
+        .as_ref()
+        .and_then(|value| value.get("items"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let title = items
+        .first()
+        .and_then(|item| item.get("title"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Memory proposal")
+        .to_string();
+
+    let proposed_memory = items
+        .iter()
+        .filter_map(|item| item.get("body").and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let item_kind = items
+        .first()
+        .and_then(|item| item.get("kind"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let mut tags = Vec::new();
+    for tag in items
+        .iter()
+        .flat_map(|item| {
+            item.get("tags")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flat_map(|values| values.iter())
+        })
+        .filter_map(|value| value.as_str())
+    {
+        if !tags.iter().any(|existing| existing == tag) {
+            tags.push(tag.to_string());
+        }
+    }
+
     assistant_protocol::MemoryProposalSummary {
         id: proposal.id,
         decision: proposal.decision,
         conversation_turn_id: proposal.conversation_turn_id.to_string(),
+        status: proposal.status,
+        created_at: proposal.created_at,
+        updated_at: proposal.updated_at,
+        title,
+        proposed_memory,
+        item_kind,
+        tags,
+        item_count: items.len(),
     }
 }
 
@@ -822,6 +1313,44 @@ fn print_jobs(db: &SqliteMemoryDb, status: Option<&str>) -> Result<(), Box<dyn E
     Ok(())
 }
 
+fn validate_local_model_filename(model: &str) -> Result<(), Box<dyn Error>> {
+    let path = std::path::Path::new(model);
+    if model.is_empty()
+        || path.file_name().and_then(|value| value.to_str()) != Some(model)
+        || path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_none_or(|value| !value.eq_ignore_ascii_case("gguf"))
+    {
+        return Err(format!("Local model must be a single .gguf filename: {model}").into());
+    }
+
+    Ok(())
+}
+
+fn discover_generation_model_filenames(
+    root: &std::path::Path,
+    embedding_model: &str,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut models = std::fs::read_dir(root)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("gguf"))
+        })
+        .filter_map(|path| {
+            let filename = path.file_name()?.to_str()?.to_string();
+            (filename != embedding_model).then_some(filename)
+        })
+        .collect::<Vec<_>>();
+
+    models.sort_by_key(|value| value.to_ascii_lowercase());
+    Ok(models)
+}
+
 fn parse_model_switch_command(text: &str) -> Option<String> {
     let cleaned = text.trim().trim_end_matches(['.', '!', '?']).trim();
     let lower = cleaned.to_ascii_lowercase();
@@ -856,8 +1385,209 @@ enum ClientCommand {
     Reminders(Option<String>),
     MemorySearch(String),
     MemoryProposals,
+    MemoryProposalAccept(String),
+    MemoryProposalReject(String),
     Jobs(Option<String>),
+    TaskMutation {
+        operation: String,
+        id: Option<String>,
+        title: Option<String>,
+        body: Option<String>,
+        due: Option<Option<String>>,
+        status: Option<String>,
+    },
+    ReminderMutation {
+        operation: String,
+        id: Option<String>,
+        title: Option<String>,
+        body: Option<String>,
+        due: Option<Option<String>>,
+    },
     Quit,
+}
+
+fn parse_task_mutation_command(text: &str) -> Result<ClientCommand, String> {
+    let remainder = text.strip_prefix(":task ").unwrap_or("").trim();
+    let mut parts = remainder.splitn(2, ' ');
+    let operation = parts.next().unwrap_or("");
+    let arguments = parts.next().unwrap_or("").trim();
+
+    match operation {
+        "create" => {
+            if arguments.is_empty() {
+                Err("Usage: :task create <title>".to_string())
+            } else {
+                Ok(ClientCommand::TaskMutation {
+                    operation: "create".to_string(),
+                    id: None,
+                    title: Some(arguments.to_string()),
+                    body: None,
+                    due: None,
+                    status: None,
+                })
+            }
+        }
+        "complete" | "cancel" => {
+            if arguments.is_empty() || arguments.contains(char::is_whitespace) {
+                Err(format!("Usage: :task {operation} <id>"))
+            } else {
+                Ok(ClientCommand::TaskMutation {
+                    operation: operation.to_string(),
+                    id: Some(arguments.to_string()),
+                    title: None,
+                    body: None,
+                    due: None,
+                    status: None,
+                })
+            }
+        }
+        "update" => {
+            let mut parts = arguments.splitn(2, ' ');
+            let id = parts.next().unwrap_or("").trim();
+            let assignment = parts.next().unwrap_or("").trim();
+            if id.is_empty() || assignment.is_empty() {
+                return Err("Usage: :task update <id> <field>=<value>".to_string());
+            }
+
+            let (field, value) = assignment
+                .split_once('=')
+                .ok_or_else(|| "Usage: :task update <id> <field>=<value>".to_string())?;
+            let field = field.trim().to_ascii_lowercase();
+            let value = value.trim();
+
+            match field.as_str() {
+                "title" => Ok(ClientCommand::TaskMutation {
+                    operation: "update".to_string(),
+                    id: Some(id.to_string()),
+                    title: Some(value.to_string()),
+                    body: None,
+                    due: None,
+                    status: None,
+                }),
+                "body" => Ok(ClientCommand::TaskMutation {
+                    operation: "update".to_string(),
+                    id: Some(id.to_string()),
+                    title: None,
+                    body: Some(value.to_string()),
+                    due: None,
+                    status: None,
+                }),
+                "due" => Ok(ClientCommand::TaskMutation {
+                    operation: "update".to_string(),
+                    id: Some(id.to_string()),
+                    title: None,
+                    body: None,
+                    due: Some(if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    }),
+                    status: None,
+                }),
+                "status" => Ok(ClientCommand::TaskMutation {
+                    operation: "update".to_string(),
+                    id: Some(id.to_string()),
+                    title: None,
+                    body: None,
+                    due: None,
+                    status: Some(value.to_string()),
+                }),
+                _ => Err("Task update fields: title, body, due, status".to_string()),
+            }
+        }
+        _ => Err("Task operations: create, update, complete, cancel".to_string()),
+    }
+}
+
+fn parse_reminder_mutation_command(text: &str) -> Result<ClientCommand, String> {
+    let remainder = text.strip_prefix(":reminder ").unwrap_or("").trim();
+    let mut parts = remainder.splitn(2, ' ');
+    let operation = parts.next().unwrap_or("");
+    let arguments = parts.next().unwrap_or("").trim();
+
+    match operation {
+        "create" => {
+            if arguments.is_empty() {
+                return Err("Usage: :reminder create <title> [due=<value>]".to_string());
+            }
+
+            let (title, due) = if let Some((title, due)) = arguments.rsplit_once(" due=") {
+                let title = title.trim();
+                let due = due.trim();
+                if title.is_empty() || due.is_empty() {
+                    return Err("Usage: :reminder create <title> [due=<value>]".to_string());
+                }
+                (title.to_string(), Some(Some(due.to_string())))
+            } else {
+                (arguments.to_string(), None)
+            };
+
+            Ok(ClientCommand::ReminderMutation {
+                operation: "create".to_string(),
+                id: None,
+                title: Some(title),
+                body: None,
+                due,
+            })
+        }
+        "cancel" => {
+            if arguments.is_empty() || arguments.contains(char::is_whitespace) {
+                Err("Usage: :reminder cancel <id>".to_string())
+            } else {
+                Ok(ClientCommand::ReminderMutation {
+                    operation: "cancel".to_string(),
+                    id: Some(arguments.to_string()),
+                    title: None,
+                    body: None,
+                    due: None,
+                })
+            }
+        }
+        "update" => {
+            let mut parts = arguments.splitn(2, ' ');
+            let id = parts.next().unwrap_or("").trim();
+            let assignment = parts.next().unwrap_or("").trim();
+            if id.is_empty() || assignment.is_empty() {
+                return Err("Usage: :reminder update <id> <field>=<value>".to_string());
+            }
+
+            let (field, value) = assignment
+                .split_once('=')
+                .ok_or_else(|| "Usage: :reminder update <id> <field>=<value>".to_string())?;
+            let field = field.trim().to_ascii_lowercase();
+            let value = value.trim();
+
+            match field.as_str() {
+                "title" => Ok(ClientCommand::ReminderMutation {
+                    operation: "update".to_string(),
+                    id: Some(id.to_string()),
+                    title: Some(value.to_string()),
+                    body: None,
+                    due: None,
+                }),
+                "body" => Ok(ClientCommand::ReminderMutation {
+                    operation: "update".to_string(),
+                    id: Some(id.to_string()),
+                    title: None,
+                    body: Some(value.to_string()),
+                    due: None,
+                }),
+                "due" => Ok(ClientCommand::ReminderMutation {
+                    operation: "update".to_string(),
+                    id: Some(id.to_string()),
+                    title: None,
+                    body: None,
+                    due: Some(if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    }),
+                }),
+                _ => Err("Reminder update fields: title, body, due".to_string()),
+            }
+        }
+        _ => Err("Reminder operations: create, update, cancel".to_string()),
+    }
 }
 
 fn parse_client_command(text: &str) -> Result<ClientCommand, String> {
@@ -872,7 +1602,29 @@ fn parse_client_command(text: &str) -> Result<ClientCommand, String> {
         ":tasks" => Ok(ClientCommand::Tasks(None)),
         ":reminders" => Ok(ClientCommand::Reminders(None)),
         ":memory-proposals" => Ok(ClientCommand::MemoryProposals),
+        ":memory-accept" => Err("Usage: :memory-accept <proposal-id>".to_string()),
+        ":memory-reject" => Err("Usage: :memory-reject <proposal-id>".to_string()),
+        _ if text.starts_with(":memory-accept ") => {
+            let proposal_id = text.strip_prefix(":memory-accept ").unwrap_or("").trim();
+            if proposal_id.is_empty() || proposal_id.contains(char::is_whitespace) {
+                Err("Usage: :memory-accept <proposal-id>".to_string())
+            } else {
+                Ok(ClientCommand::MemoryProposalAccept(proposal_id.to_string()))
+            }
+        }
+        _ if text.starts_with(":memory-reject ") => {
+            let proposal_id = text.strip_prefix(":memory-reject ").unwrap_or("").trim();
+            if proposal_id.is_empty() || proposal_id.contains(char::is_whitespace) {
+                Err("Usage: :memory-reject <proposal-id>".to_string())
+            } else {
+                Ok(ClientCommand::MemoryProposalReject(proposal_id.to_string()))
+            }
+        }
         ":jobs" => Ok(ClientCommand::Jobs(None)),
+        ":task" => Err("Usage: :task [create|update|complete|cancel] ...".to_string()),
+        ":reminder" => Err("Usage: :reminder [create|update|cancel] ...".to_string()),
+        _ if text.starts_with(":task ") => parse_task_mutation_command(text),
+        _ if text.starts_with(":reminder ") => parse_reminder_mutation_command(text),
         _ if text.starts_with(":chat ") => {
             let message = text.strip_prefix(":chat ").unwrap_or("").trim();
             if message.is_empty() {
@@ -926,7 +1678,7 @@ fn parse_client_command(text: &str) -> Result<ClientCommand, String> {
         }
         _ if !text.starts_with(':') => Ok(ClientCommand::Chat(text.to_string())),
         _ => Err(
-            "Client commands: plain text, :chat <text>, :ping, :health, :model [list|status|use <id>], :tasks [status], :reminders [status], :memory search <query>, :memory-proposals, :jobs [status], :quit"
+            "Client commands: plain text, :chat <text>, :ping, :health, :model [list|status|use <id>], :tasks [status], :reminders [status], :memory search <query>, :memory-proposals, :memory-accept <id>, :memory-reject <id>, :jobs [status], :task [create|update|complete|cancel] ..., :reminder [create|update|cancel] ..., :quit"
                 .to_string(),
         ),
     }
@@ -1047,11 +1799,22 @@ fn print_client_response(response: ResponsePayload) {
             }
             println!();
         }
+        ResponsePayload::Mutation(mutation) => {
+            println!("{} {} succeeded:", mutation.tool, mutation.operation);
+            println!("{}", mutation.output);
+        }
+        ResponsePayload::Lease(lease) => {
+            println!(
+                "Client lease {} | active clients={}",
+                lease.client_id, lease.active_clients
+            );
+        }
     }
 }
 
 fn run_client_mode() -> Result<(), Box<dyn Error>> {
     let socket_path = ipc::default_socket_path()?;
+    let _lease = assistant_client::ClientLease::acquire(&socket_path)?;
     let client = assistant_client::IpcClient::new(&socket_path);
 
     println!("============================================================");
@@ -1059,7 +1822,7 @@ fn run_client_mode() -> Result<(), Box<dyn Error>> {
     println!("============================================================");
     println!("Runtime socket: {}", socket_path.display());
     println!(
-        "Commands: plain text or :chat <text>, :ping, :health, :model [list|status|use <id>], :quit"
+        "Commands: plain text or :chat <text>, :ping, :health, :model [list|status|use <id>], :tasks [status], :reminders [status], :memory search <query>, :memory-proposals, :memory-accept <id>, :memory-reject <id>, :jobs [status], :task [create|update|complete|cancel] ..., :reminder [create|update|cancel] ..., :quit"
     );
     println!("============================================================");
     println!();
@@ -1111,9 +1874,43 @@ fn run_client_mode() -> Result<(), Box<dyn Error>> {
                 RequestMethod::MemorySearch { query, limit: None }
             }
             ClientCommand::MemoryProposals => RequestMethod::MemoryProposals { limit: None },
+            ClientCommand::MemoryProposalAccept(proposal_id) => {
+                RequestMethod::MemoryProposalAccept { id: proposal_id }
+            }
+            ClientCommand::MemoryProposalReject(proposal_id) => {
+                RequestMethod::MemoryProposalReject { id: proposal_id }
+            }
             ClientCommand::Jobs(status) => RequestMethod::JobsList {
                 status,
                 limit: None,
+            },
+            ClientCommand::TaskMutation {
+                operation,
+                id,
+                title,
+                body,
+                due,
+                status,
+            } => RequestMethod::TasksMutate {
+                operation,
+                id,
+                title,
+                body,
+                due,
+                status,
+            },
+            ClientCommand::ReminderMutation {
+                operation,
+                id,
+                title,
+                body,
+                due,
+            } => RequestMethod::RemindersMutate {
+                operation,
+                id,
+                title,
+                body,
+                due,
             },
             ClientCommand::Quit => unreachable!(),
         };
@@ -1139,6 +1936,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     if client_mode {
         return run_client_mode();
     }
+
+    let _runtime_instance_lock = if daemon_mode {
+        Some(RuntimeInstanceLock::acquire()?)
+    } else {
+        None
+    };
 
     let memory_root = memory_root()?;
 
@@ -1181,6 +1984,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Qwen:         {}", qwen_url);
     println!("Embeddings:   {}", embedding_url);
     println!("============================================================");
+
+    let local_services =
+        LocalServiceSupervisor::start(&qwen_url, &qwen_model, &embedding_url, &embedding_model)?;
 
     let indexer = PersistentMemoryIndexer::new(
         &db_path,
@@ -1293,11 +2099,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let tool_executor = IndexedToolExecutor::new(registry, indexer.clone());
 
+    let qwen_model_state = Arc::new(RwLock::new(qwen_model.clone()));
     let model_session = ModelSession::from_environment(&qwen_url, &qwen_model)?;
 
     let controller = SessionController::new(model_session.clone(), conversation_db);
 
-    let mut models = ModelRouter::new(qwen_url.clone(), qwen_model.clone());
+    let mut models =
+        ModelRouter::new_with_shared_qwen_model(qwen_url.clone(), Arc::clone(&qwen_model_state));
 
     if let Ok(api_key) = env::var("ASSISTANT_CLAUDE_API_KEY") {
         if api_key.trim().is_empty() {
@@ -1332,11 +2140,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(true);
 
     let mut background_workers = if background_workers_enabled {
-        match sqlite_ingest::BackgroundWorkers::start(
+        match sqlite_ingest::BackgroundWorkers::start_with_shared_model(
             &memory_root,
             &db_path,
             qwen_url.clone(),
-            qwen_model.clone(),
+            Arc::clone(&qwen_model_state),
         ) {
             Ok(workers) => {
                 println!("Background workers: memory extraction + reminder scheduler enabled.");
@@ -1374,10 +2182,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
 
     if daemon_mode {
+        let lifecycle = Arc::new(RuntimeLifecycle::from_environment()?);
         let handler = Arc::new(RuntimeIpcHandler {
             model_session: model_session.clone(),
             orchestrator: Arc::new(Mutex::new(orchestrator)),
             indexer: indexer.clone(),
+            _local_services: Arc::new(Mutex::new(local_services)),
+            lifecycle,
         });
         let socket_path = ipc::default_socket_path()?;
         ipc::serve(&socket_path, handler)
@@ -1690,6 +2501,50 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+
+    #[test]
+    fn memory_proposal_summary_maps_payload_metadata() {
+        let proposal = sqlite_memory::MemoryExtractionProposal {
+            id: "proposal-test".to_string(),
+            conversation_turn_id: 42,
+            decision: "should_save".to_string(),
+            payload_json: r#"{
+                "decision": "should_save",
+                "items": [
+                    {
+                        "kind": "fact",
+                        "title": "Runtime architecture",
+                        "body": "Zaraki uses a Rust runtime.",
+                        "tags": ["Zaraki", "runtime"]
+                    },
+                    {
+                        "kind": "idea",
+                        "title": "Future idea",
+                        "body": "Add richer proposal filtering.",
+                        "tags": ["Zaraki"]
+                    }
+                ]
+            }"#
+            .to_string(),
+            status: "pending".to_string(),
+            created_at: "2026-09-21T12:00:00Z".to_string(),
+            updated_at: "2026-09-21T12:05:00Z".to_string(),
+        };
+
+        let summary = memory_proposal_summary(proposal);
+        assert_eq!(summary.title, "Runtime architecture");
+        assert_eq!(
+            summary.proposed_memory,
+            "Zaraki uses a Rust runtime.\n\nAdd richer proposal filtering."
+        );
+        assert_eq!(summary.item_kind, "fact");
+        assert_eq!(summary.item_count, 2);
+        assert_eq!(
+            summary.tags,
+            vec!["Zaraki".to_string(), "runtime".to_string()]
+        );
+        assert_eq!(summary.status, "pending");
+    }
     use std::{io::Read, net::TcpListener, thread};
 
     struct FakeController {
@@ -1807,14 +2662,118 @@ mod session_tests {
             Ok(ClientCommand::MemoryProposals)
         );
         assert_eq!(
+            parse_client_command(":memory-accept proposal-123"),
+            Ok(ClientCommand::MemoryProposalAccept(
+                "proposal-123".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_client_command(":memory-reject proposal-456"),
+            Ok(ClientCommand::MemoryProposalReject(
+                "proposal-456".to_string()
+            ))
+        );
+        assert_eq!(
             parse_client_command(":jobs failed"),
             Ok(ClientCommand::Jobs(Some("failed".to_string())))
         );
     }
 
     #[test]
+    fn client_command_parser_accepts_task_mutation_commands() {
+        assert_eq!(
+            parse_client_command(":task create Review RCM report"),
+            Ok(ClientCommand::TaskMutation {
+                operation: "create".to_string(),
+                id: None,
+                title: Some("Review RCM report".to_string()),
+                body: None,
+                due: None,
+                status: None,
+            })
+        );
+        assert_eq!(
+            parse_client_command(":task complete task:review-rcm"),
+            Ok(ClientCommand::TaskMutation {
+                operation: "complete".to_string(),
+                id: Some("task:review-rcm".to_string()),
+                title: None,
+                body: None,
+                due: None,
+                status: None,
+            })
+        );
+        assert_eq!(
+            parse_client_command(":task update task:review-rcm title=Updated title"),
+            Ok(ClientCommand::TaskMutation {
+                operation: "update".to_string(),
+                id: Some("task:review-rcm".to_string()),
+                title: Some("Updated title".to_string()),
+                body: None,
+                due: None,
+                status: None,
+            })
+        );
+        assert_eq!(
+            parse_client_command(":task update task:review-rcm due="),
+            Ok(ClientCommand::TaskMutation {
+                operation: "update".to_string(),
+                id: Some("task:review-rcm".to_string()),
+                title: None,
+                body: None,
+                due: Some(None),
+                status: None,
+            })
+        );
+    }
+
+    #[test]
+    fn client_command_parser_accepts_reminder_mutation_commands() {
+        assert_eq!(
+            parse_client_command(":reminder create Review RCM report due=tomorrow at 6 PM"),
+            Ok(ClientCommand::ReminderMutation {
+                operation: "create".to_string(),
+                id: None,
+                title: Some("Review RCM report".to_string()),
+                body: None,
+                due: Some(Some("tomorrow at 6 PM".to_string())),
+            })
+        );
+        assert_eq!(
+            parse_client_command(":reminder update reminder:review-rcm due="),
+            Ok(ClientCommand::ReminderMutation {
+                operation: "update".to_string(),
+                id: Some("reminder:review-rcm".to_string()),
+                title: None,
+                body: None,
+                due: Some(None),
+            })
+        );
+        assert_eq!(
+            parse_client_command(":reminder cancel reminder:review-rcm"),
+            Ok(ClientCommand::ReminderMutation {
+                operation: "cancel".to_string(),
+                id: Some("reminder:review-rcm".to_string()),
+                title: None,
+                body: None,
+                due: None,
+            })
+        );
+    }
+
+    #[test]
+    fn client_command_parser_rejects_invalid_reminder_mutations() {
+        assert!(parse_client_command(":reminder").is_err());
+        assert!(parse_client_command(":reminder cancel").is_err());
+        assert!(parse_client_command(":reminder update reminder:foo color=red").is_err());
+        assert!(parse_client_command(":reminder create Follow up due=").is_err());
+    }
+
+    #[test]
     fn client_command_parser_rejects_unrecognized_input() {
         assert!(parse_client_command(":model switch qwen").is_err());
+        assert!(parse_client_command(":memory-accept").is_err());
+        assert!(parse_client_command(":memory-reject").is_err());
         assert!(parse_client_command(":unknown").is_err());
     }
 
@@ -2120,6 +3079,54 @@ mod session_tests {
     }
 
     #[test]
+    fn qwen_environment_model_is_used_as_display_name() -> Result<(), Box<dyn Error>> {
+        let session = ModelSession::from_environment(
+            "http://127.0.0.1:18080",
+            "Mistral-7B-Instruct-v0.3.gguf",
+        )?;
+
+        let definition = session.active_definition()?;
+        assert_eq!(definition.id, "qwen");
+        assert_eq!(definition.model, "Mistral-7B-Instruct-v0.3.gguf");
+        assert_eq!(definition.display_name, "Mistral-7B-Instruct-v0.3.gguf");
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_local_model_definition_uses_filename() -> Result<(), Box<dyn Error>> {
+        let session =
+            ModelSession::from_environment("http://127.0.0.1:18080", "Qwen3.5-4B-Q4_K_M.gguf")?;
+
+        let definition = session.dynamic_local_definition("local:Mistral-7B.gguf")?;
+        assert_eq!(definition.id, "local:Mistral-7B.gguf");
+        assert_eq!(definition.display_name, "Mistral-7B.gguf");
+        assert_eq!(definition.base_url, "http://127.0.0.1:18080");
+        assert_eq!(definition.model, "Mistral-7B.gguf");
+        Ok(())
+    }
+
+    #[test]
+    fn discovered_model_filenames_exclude_embedding_model() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("Qwen.gguf"), b"model")?;
+        std::fs::write(directory.path().join("Mistral.GGUF"), b"model")?;
+        std::fs::write(
+            directory.path().join("bge-small-en-v1.5-q8_0.gguf"),
+            b"embedding",
+        )?;
+        std::fs::write(directory.path().join("notes.txt"), b"not a model")?;
+
+        let models =
+            discover_generation_model_filenames(directory.path(), "bge-small-en-v1.5-q8_0.gguf")?;
+
+        assert_eq!(
+            models,
+            vec!["Mistral.GGUF".to_string(), "Qwen.gguf".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn model_list_reports_backend_availability() -> Result<(), Box<dyn Error>> {
         let (available_url, server) = spawn_ok_model_server()?;
         let unavailable_url = unavailable_model_url()?;
@@ -2149,6 +3156,8 @@ mod session_tests {
         let session = ModelSession {
             models: Arc::new(models),
             active_model: Arc::new(RwLock::new("qwen".to_string())),
+            model_root: None,
+            embedding_model: "bge-small-en-v1.5-q8_0.gguf".to_string(),
         };
 
         let models = session.list_models()?;
@@ -2196,6 +3205,8 @@ mod session_tests {
         let session = ModelSession {
             models: Arc::new(models),
             active_model: Arc::new(RwLock::new("qwen".to_string())),
+            model_root: None,
+            embedding_model: "bge-small-en-v1.5-q8_0.gguf".to_string(),
         };
 
         let selected = session.switch_model("gemma")?;

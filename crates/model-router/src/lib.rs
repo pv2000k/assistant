@@ -2,7 +2,12 @@ use orchestrator::{ModelCall, ModelExecutor, ModelResult, ModelTarget};
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, error::Error, time::Duration};
+use std::{
+    collections::HashMap,
+    error::Error,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -33,27 +38,57 @@ pub trait ModelBackend: Send + Sync {
         let _ = response_format;
         self.execute(prompt)
     }
+
+    fn set_model(&self, _model: &str) -> Result<()> {
+        Err("This model backend does not support runtime model switching.".into())
+    }
 }
 
 #[derive(Debug, Clone)]
 struct QwenBackend {
     base_url: String,
-    model: String,
+    model: Arc<RwLock<String>>,
     timeout: Duration,
     capabilities: Vec<ModelCapability>,
 }
 
 impl QwenBackend {
+    #[cfg(test)]
     fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::with_shared_model(base_url, Arc::new(RwLock::new(model.into())))
+    }
+
+    fn with_shared_model(base_url: impl Into<String>, model: Arc<RwLock<String>>) -> Self {
         Self {
             base_url: base_url.into(),
-            model: model.into(),
+            model,
             timeout: Duration::from_secs(120),
             capabilities: vec![
                 ModelCapability::Controller,
                 ModelCapability::GeneralResponse,
             ],
         }
+    }
+
+    fn current_model(&self) -> Result<String> {
+        Ok(self
+            .model
+            .read()
+            .map_err(|_| "Qwen model state lock was poisoned.")?
+            .clone())
+    }
+
+    fn set_model(&self, model: &str) -> Result<()> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err("Qwen model cannot be empty.".into());
+        }
+
+        *self
+            .model
+            .write()
+            .map_err(|_| "Qwen model state lock was poisoned.")? = model.to_string();
+        Ok(())
     }
 
     fn endpoint(&self) -> String {
@@ -321,6 +356,10 @@ impl ModelBackend for QwenBackend {
         &self.capabilities
     }
 
+    fn set_model(&self, model: &str) -> Result<()> {
+        self.set_model(model)
+    }
+
     fn execute(&self, prompt: &str) -> Result<String> {
         self.execute_with_response_format(prompt, None)
     }
@@ -337,7 +376,7 @@ impl ModelBackend for QwenBackend {
         let client = Client::builder().timeout(self.timeout).build()?;
 
         let mut request = serde_json::json!({
-            "model": self.model,
+            "model": self.current_model()?,
             "messages": [
                 {
                     "role": "user",
@@ -403,11 +442,26 @@ impl std::fmt::Debug for ModelRouter {
 
 impl ModelRouter {
     pub fn new(qwen_url: impl Into<String>, qwen_model: impl Into<String>) -> Self {
+        Self::new_with_shared_qwen_model(qwen_url, Arc::new(RwLock::new(qwen_model.into())))
+    }
+
+    pub fn new_with_shared_qwen_model(
+        qwen_url: impl Into<String>,
+        qwen_model: Arc<RwLock<String>>,
+    ) -> Self {
         let mut router = Self::empty();
         router
-            .register(QwenBackend::new(qwen_url, qwen_model))
+            .register(QwenBackend::with_shared_model(qwen_url, qwen_model))
             .expect("Qwen backend registration must not fail in a fresh router.");
         router
+    }
+
+    pub fn set_qwen_model(&self, model: &str) -> Result<()> {
+        let backend = self
+            .backends
+            .get(&ModelTarget::Qwen)
+            .ok_or("Qwen backend is not registered.")?;
+        backend.set_model(model)
     }
 
     pub fn empty() -> Self {
@@ -579,6 +633,24 @@ mod tests {
         assert!(router.supports(&ModelTarget::Qwen, ModelCapability::Controller));
         assert!(router.supports(&ModelTarget::Qwen, ModelCapability::GeneralResponse));
         assert!(!router.supports(&ModelTarget::Qwen, ModelCapability::CodingAgent));
+    }
+
+    #[test]
+    fn qwen_model_can_be_switched_through_shared_state() -> Result<()> {
+        let shared = Arc::new(RwLock::new("old.gguf".to_string()));
+        let router =
+            ModelRouter::new_with_shared_qwen_model("http://127.0.0.1:8080", Arc::clone(&shared));
+
+        router.set_qwen_model("new.gguf")?;
+
+        assert_eq!(
+            shared
+                .read()
+                .map_err(|_| "shared model lock was poisoned.")?
+                .as_str(),
+            "new.gguf"
+        );
+        Ok(())
     }
 
     #[test]
