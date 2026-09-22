@@ -55,6 +55,7 @@ dependencies = [
  "crossterm",
  "ratatui",
  "serde_json",
+ "time",
 ]
 
 [[package]]
@@ -1481,6 +1482,7 @@ version = "0.1.0"
 dependencies = [
  "assistant-client",
  "assistant-protocol",
+ "libc",
  "model-router",
  "orchestrator",
  "reqwest",

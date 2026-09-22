@@ -238,8 +238,11 @@ pub struct TaskList {
 pub struct TaskSummary {
     pub id: String,
     pub title: String,
+    pub body: String,
     pub status: String,
     pub due_at: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,8 +254,11 @@ pub struct ReminderList {
 pub struct ReminderSummary {
     pub id: String,
     pub title: String,
+    pub body: String,
     pub status: String,
     pub due_at: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -277,6 +283,14 @@ pub struct MemoryProposalSummary {
     pub id: String,
     pub decision: String,
     pub conversation_turn_id: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub title: String,
+    pub proposed_memory: String,
+    pub item_kind: String,
+    pub tags: Vec<String>,
+    pub item_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -499,6 +513,32 @@ mod tests {
 
         assert_eq!(WireRequest::decode_line(&accept.encode_line()?)?, accept);
         assert_eq!(WireRequest::decode_line(&reject.encode_line()?)?, reject);
+        Ok(())
+    }
+
+    #[test]
+    fn memory_proposal_summary_response_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let response = WireResponse::ok(
+            21,
+            ResponsePayload::Proposals(MemoryProposalList {
+                proposals: vec![MemoryProposalSummary {
+                    id: "proposal-1".to_string(),
+                    decision: "should_save".to_string(),
+                    conversation_turn_id: "42".to_string(),
+                    status: "pending".to_string(),
+                    created_at: "2026-09-21T12:00:00Z".to_string(),
+                    updated_at: "2026-09-21T12:00:00Z".to_string(),
+                    title: "Test memory".to_string(),
+                    proposed_memory: "A durable fact.".to_string(),
+                    item_kind: "fact".to_string(),
+                    tags: vec!["project:zaraki".to_string()],
+                    item_count: 1,
+                }],
+            }),
+        );
+
+        let decoded = WireResponse::decode_line(&response.encode_line()?)?;
+        assert_eq!(decoded, response);
         Ok(())
     }
 

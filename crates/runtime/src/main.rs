@@ -1,3 +1,4 @@
+mod instance_lock;
 mod ipc;
 mod lifecycle;
 mod process_supervisor;
@@ -7,6 +8,7 @@ use assistant_protocol::{
     ModelList, ModelState, ReminderList, RequestMethod, ResponsePayload, TaskList, WireRequest,
     WireResponse,
 };
+use instance_lock::RuntimeInstanceLock;
 use lifecycle::RuntimeLifecycle;
 use model_router::ModelRouter;
 use orchestrator::{
@@ -1093,8 +1095,11 @@ fn task_summary(record: sqlite_memory::TaskRecord) -> assistant_protocol::TaskSu
     assistant_protocol::TaskSummary {
         id: record.id,
         title: record.title,
+        body: record.body,
         status: record.status,
         due_at: record.due_at,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
     }
 }
 
@@ -1102,18 +1107,76 @@ fn reminder_summary(record: sqlite_memory::ReminderRecord) -> assistant_protocol
     assistant_protocol::ReminderSummary {
         id: record.id,
         title: record.title,
+        body: record.body,
         status: record.status,
         due_at: record.due_at,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
     }
 }
 
 fn memory_proposal_summary(
     proposal: sqlite_memory::MemoryExtractionProposal,
 ) -> assistant_protocol::MemoryProposalSummary {
+    let payload = serde_json::from_str::<serde_json::Value>(&proposal.payload_json).ok();
+    let items = payload
+        .as_ref()
+        .and_then(|value| value.get("items"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let title = items
+        .first()
+        .and_then(|item| item.get("title"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Memory proposal")
+        .to_string();
+
+    let proposed_memory = items
+        .iter()
+        .filter_map(|item| item.get("body").and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let item_kind = items
+        .first()
+        .and_then(|item| item.get("kind"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let mut tags = Vec::new();
+    for tag in items
+        .iter()
+        .flat_map(|item| {
+            item.get("tags")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flat_map(|values| values.iter())
+        })
+        .filter_map(|value| value.as_str())
+    {
+        if !tags.iter().any(|existing| existing == tag) {
+            tags.push(tag.to_string());
+        }
+    }
+
     assistant_protocol::MemoryProposalSummary {
         id: proposal.id,
         decision: proposal.decision,
         conversation_turn_id: proposal.conversation_turn_id.to_string(),
+        status: proposal.status,
+        created_at: proposal.created_at,
+        updated_at: proposal.updated_at,
+        title,
+        proposed_memory,
+        item_kind,
+        tags,
+        item_count: items.len(),
     }
 }
 
@@ -1874,6 +1937,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         return run_client_mode();
     }
 
+    let _runtime_instance_lock = if daemon_mode {
+        Some(RuntimeInstanceLock::acquire()?)
+    } else {
+        None
+    };
+
     let memory_root = memory_root()?;
 
     std::fs::create_dir_all(&memory_root)?;
@@ -2432,6 +2501,50 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+
+    #[test]
+    fn memory_proposal_summary_maps_payload_metadata() {
+        let proposal = sqlite_memory::MemoryExtractionProposal {
+            id: "proposal-test".to_string(),
+            conversation_turn_id: 42,
+            decision: "should_save".to_string(),
+            payload_json: r#"{
+                "decision": "should_save",
+                "items": [
+                    {
+                        "kind": "fact",
+                        "title": "Runtime architecture",
+                        "body": "Zaraki uses a Rust runtime.",
+                        "tags": ["Zaraki", "runtime"]
+                    },
+                    {
+                        "kind": "idea",
+                        "title": "Future idea",
+                        "body": "Add richer proposal filtering.",
+                        "tags": ["Zaraki"]
+                    }
+                ]
+            }"#
+            .to_string(),
+            status: "pending".to_string(),
+            created_at: "2026-09-21T12:00:00Z".to_string(),
+            updated_at: "2026-09-21T12:05:00Z".to_string(),
+        };
+
+        let summary = memory_proposal_summary(proposal);
+        assert_eq!(summary.title, "Runtime architecture");
+        assert_eq!(
+            summary.proposed_memory,
+            "Zaraki uses a Rust runtime.\n\nAdd richer proposal filtering."
+        );
+        assert_eq!(summary.item_kind, "fact");
+        assert_eq!(summary.item_count, 2);
+        assert_eq!(
+            summary.tags,
+            vec!["Zaraki".to_string(), "runtime".to_string()]
+        );
+        assert_eq!(summary.status, "pending");
+    }
     use std::{io::Read, net::TcpListener, thread};
 
     struct FakeController {

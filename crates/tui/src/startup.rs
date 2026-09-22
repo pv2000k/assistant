@@ -15,6 +15,7 @@ const DEFAULT_EMBEDDING_MODEL: &str = "bge-small-en-v1.5-q8_0.gguf";
 const DEFAULT_RUNTIME_LOG: &str = ".cache/assistant/runtime.log";
 const RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const EXISTING_RUNTIME_GRACE: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelChoice {
@@ -86,6 +87,15 @@ impl RuntimeLaunch {
 
         while Instant::now() < deadline {
             if let Some(status) = self.child.try_wait()? {
+                let grace_deadline = (Instant::now() + EXISTING_RUNTIME_GRACE).min(deadline);
+                while Instant::now() < grace_deadline {
+                    if let Some(runtime) = probe_runtime_with_client(&client) {
+                        if runtime.health.ready && runtime.model_status.ready {
+                            return Ok(());
+                        }
+                    }
+                    thread::sleep(RUNTIME_POLL_INTERVAL);
+                }
                 return Err(runtime_exit_error(status));
             }
 

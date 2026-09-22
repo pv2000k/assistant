@@ -13,3 +13,4 @@ assistant-protocol = { path = "../assistant-protocol" }
 crossterm = "0.29"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 serde_json = "1"
+time = { version = "0.3", features = ["formatting", "parsing", "local-offset"] }

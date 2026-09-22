@@ -2,7 +2,7 @@ mod startup;
 
 use std::{
     error::Error,
-    io::{self, Write},
+    io,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
@@ -12,7 +12,6 @@ use std::{
 use assistant_client::{ClientLease, IpcClient, IpcClientError, default_socket_path};
 use assistant_protocol::{ChatResponse, HealthStatus, ModelState, RequestMethod, ResponsePayload};
 use crossterm::{
-    Command,
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
@@ -155,14 +154,13 @@ struct UiProposal {
     id: String,
     title: String,
     created_at: String,
-    updated_at: String,
     decision: String,
-    status: String,
     conversation_turn_id: String,
     proposed_memory: String,
-    item_kind: String,
-    tags: Vec<String>,
-    item_count: usize,
+    main_project: String,
+    sub_project: String,
+    affected_entity: String,
+    reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,7 +186,6 @@ struct UiJob {
     next_run_at: String,
 }
 
-#[cfg(test)]
 fn demo_tasks() -> Vec<UiTask> {
     vec![
         UiTask {
@@ -271,7 +268,6 @@ fn demo_tasks() -> Vec<UiTask> {
     ]
 }
 
-#[cfg(test)]
 fn demo_reminders() -> Vec<UiReminder> {
     vec![
         UiReminder {
@@ -309,6 +305,126 @@ fn demo_reminders() -> Vec<UiReminder> {
             due_at: Some("21-09-26 14:30".into()),
             created_at: "21-09-26 10:30".into(),
             updated_at: "21-09-26 14:45".into(),
+        },
+    ]
+}
+
+fn demo_proposals() -> Vec<UiProposal> {
+    vec![
+        UiProposal {
+            id: "demo-proposal-1".into(),
+            title: "Conversation about Zaraki frontend work".into(),
+            created_at: "21-09-26 12:40".into(),
+            decision: "pending".into(),
+            conversation_turn_id: "turn-frontend-001".into(),
+            proposed_memory: "The Zaraki TUI is being completed frontend-first, with backend integration deferred until the UI is stable.".into(),
+            main_project: "Zaraki".into(),
+            sub_project: "TUI frontend".into(),
+            affected_entity: "Zaraki TUI architecture".into(),
+            reason: "Useful long-lived project context for future implementation sessions.".into(),
+        },
+        UiProposal {
+            id: "demo-proposal-2".into(),
+            title: "Conversation about RCM analytics".into(),
+            created_at: "20-09-26 17:15".into(),
+            decision: "should_save".into(),
+            conversation_turn_id: "turn-rcm-014".into(),
+            proposed_memory: "RCM analytics work includes KPI definitions, logical data modelling, and a bronze-to-silver Azure pipeline.".into(),
+            main_project: "RCM Analytics".into(),
+            sub_project: "Data platform".into(),
+            affected_entity: "RCM analytics architecture".into(),
+            reason: "Captures a recurring project direction.".into(),
+        },
+        UiProposal {
+            id: "demo-proposal-3".into(),
+            title: "Conversation about local model stack".into(),
+            created_at: "19-09-26 11:20".into(),
+            decision: "should_not_save".into(),
+            conversation_turn_id: "turn-local-ai-008".into(),
+            proposed_memory: "A transient local model debugging detail from a single session.".into(),
+            main_project: "Local AI".into(),
+            sub_project: "Debugging".into(),
+            affected_entity: "Runtime troubleshooting".into(),
+            reason: "Too transient to keep as long-lived memory.".into(),
+        },
+    ]
+}
+
+fn demo_models() -> Vec<UiModel> {
+    vec![
+        UiModel {
+            id: "local:Qwen3.5-4B-Q4_K_M.gguf".into(),
+            display_name: "Qwen3.5-4B-Q4_K_M.gguf".into(),
+            available: true,
+            active: true,
+            capabilities: vec!["chat".into(), "reasoning".into()],
+            location: "LOCAL".into(),
+            endpoint: "127.0.0.1:8080".into(),
+            context: "4096".into(),
+            vram: "~3.2 GiB".into(),
+            pid: "runtime-owned".into(),
+            speed: "live runtime metric".into(),
+        },
+        UiModel {
+            id: "local:Phi-4-mini-instruct-Q4_K_M.gguf".into(),
+            display_name: "Phi-4-mini-instruct-Q4_K_M.gguf".into(),
+            available: true,
+            active: false,
+            capabilities: vec!["chat".into()],
+            location: "LOCAL".into(),
+            endpoint: "127.0.0.1:8080".into(),
+            context: "4096".into(),
+            vram: "~2.8 GiB".into(),
+            pid: "runtime-owned".into(),
+            speed: "live runtime metric".into(),
+        },
+        UiModel {
+            id: "cloud:Claude".into(),
+            display_name: "Claude".into(),
+            available: true,
+            active: false,
+            capabilities: vec!["chat".into(), "analysis".into()],
+            location: "CLOUD".into(),
+            endpoint: "cloud backend".into(),
+            context: "provider-defined".into(),
+            vram: "n/a".into(),
+            pid: "n/a".into(),
+            speed: "provider-defined".into(),
+        },
+    ]
+}
+
+fn demo_jobs() -> Vec<UiJob> {
+    vec![
+        UiJob {
+            id: "job-1".into(),
+            job_type: "memory extraction".into(),
+            status: "running".into(),
+            next_run_at: "now".into(),
+        },
+        UiJob {
+            id: "job-2".into(),
+            job_type: "reminder scheduler".into(),
+            status: "queued".into(),
+            next_run_at: "21-09-26 19:00".into(),
+        },
+        UiJob {
+            id: "job-3".into(),
+            job_type: "memory re-index".into(),
+            status: "completed".into(),
+            next_run_at: "21-09-26 13:20".into(),
+        },
+        UiJob {
+            id: "job-4".into(),
+            job_type: "calendar sync".into(),
+            status: "failed".into(),
+            next_run_at: "awaiting retry".into(),
+        },
+        UiJob {
+            id: "job-5".into(),
+            job_type: "proposal extraction".into(),
+            status: "queued".into(),
+            next_run_at: "21-09-26 20:00".into(),
         },
     ]
 }
@@ -415,7 +531,6 @@ impl FormState {
         let mut form = Self::reminder_create();
         form.editing_id = Some(reminder.id.clone());
         form.values[0] = reminder.title.clone();
-        form.values[1] = reminder.body.clone();
         form.values[2] = reminder.due_at.clone().unwrap_or_default();
         form.cursor = form.values[0].chars().count();
         form
@@ -513,11 +628,11 @@ impl App {
             _lease: lease,
             health: None,
             model_status: None,
-            models: Vec::new(),
+            models: demo_models(),
             tasks,
-            reminders: Vec::new(),
-            proposals: Vec::new(),
-            jobs: Vec::new(),
+            reminders: demo_reminders(),
+            proposals: demo_proposals(),
+            jobs: demo_jobs(),
             chat: Vec::new(),
             pending_chat: None,
             pending_runtime_restart: None,
@@ -550,7 +665,6 @@ impl App {
 
     fn refresh(&mut self) -> Result<(), IpcClientError> {
         self.health = Some(self.request_health()?);
-        self.models = self.request_models()?;
         let status = self.request_model_status()?;
         self.model_status = Some(status.clone());
         if let Some(active) = status.active_model.as_deref() {
@@ -578,18 +692,11 @@ impl App {
             }
         }
         sort_ui_tasks(&mut self.tasks);
-        self.reminders = self.request_reminders()?;
         sort_ui_reminders(&mut self.reminders);
-        self.proposals = self.request_proposals()?;
         sort_ui_proposals(&mut self.proposals);
-        self.jobs = self.request_jobs()?;
         sort_ui_jobs(&mut self.jobs);
         if self.tab == Tab::Search && !self.search_input.trim().is_empty() {
-            let query = self.search_input.trim().to_string();
-            match self.request_memory_search(&query) {
-                Ok(results) => self.search_results = results,
-                Err(_) => self.search_results.clear(),
-            }
+            self.search_results = self.local_search(&self.search_input);
         }
         self.normalize_selection();
         self.last_health_check = Instant::now();
@@ -611,15 +718,6 @@ impl App {
         }
     }
 
-    fn request_models(&self) -> Result<Vec<UiModel>, IpcClientError> {
-        match self.client.request(RequestMethod::ModelList)? {
-            ResponsePayload::Models(list) => {
-                Ok(list.models.into_iter().map(ui_model_from_backend).collect())
-            }
-            other => Err(unexpected_response("models", other)),
-        }
-    }
-
     fn request_tasks(&self) -> Result<Vec<UiTask>, IpcClientError> {
         let response = self.client.request(RequestMethod::TasksList {
             status: None,
@@ -629,64 +727,6 @@ impl App {
             return Err(unexpected_response("tasks", response));
         };
         Ok(list.tasks.into_iter().map(ui_task_from_backend).collect())
-    }
-
-    fn request_reminders(&self) -> Result<Vec<UiReminder>, IpcClientError> {
-        let response = self.client.request(RequestMethod::RemindersList {
-            status: None,
-            limit: Some(100),
-        })?;
-        let ResponsePayload::Reminders(list) = response else {
-            return Err(unexpected_response("reminders", response));
-        };
-        Ok(list
-            .reminders
-            .into_iter()
-            .map(ui_reminder_from_backend)
-            .collect())
-    }
-
-    fn request_proposals(&self) -> Result<Vec<UiProposal>, IpcClientError> {
-        let response = self
-            .client
-            .request(RequestMethod::MemoryProposals { limit: Some(100) })?;
-        let ResponsePayload::Proposals(list) = response else {
-            return Err(unexpected_response("memory proposals", response));
-        };
-        Ok(list
-            .proposals
-            .into_iter()
-            .map(ui_proposal_from_backend)
-            .collect())
-    }
-
-    fn request_jobs(&self) -> Result<Vec<UiJob>, IpcClientError> {
-        let response = self.client.request(RequestMethod::JobsList {
-            status: None,
-            limit: Some(100),
-        })?;
-        let ResponsePayload::Jobs(list) = response else {
-            return Err(unexpected_response("jobs", response));
-        };
-        Ok(list.jobs.into_iter().map(ui_job_from_backend).collect())
-    }
-
-    fn request_memory_search(
-        &self,
-        query: &str,
-    ) -> Result<Vec<(String, String, f64)>, IpcClientError> {
-        let response = self.client.request(RequestMethod::MemorySearch {
-            query: query.to_string(),
-            limit: Some(100),
-        })?;
-        let ResponsePayload::Memory(list) = response else {
-            return Err(unexpected_response("memory search", response));
-        };
-        Ok(list
-            .results
-            .into_iter()
-            .map(ui_search_result_from_backend)
-            .collect())
     }
 
     fn normalize_selection(&mut self) {
@@ -864,49 +904,27 @@ impl App {
     }
 
     fn accept_selected_proposal(&mut self) {
-        let Some(proposal) = self.selected_proposal().cloned() else {
+        if self.selected >= self.proposals.len() {
             return;
-        };
-        match self.client.request(RequestMethod::MemoryProposalAccept {
-            id: proposal.id.clone(),
-        }) {
-            Ok(ResponsePayload::Mutation(_)) => match self.refresh() {
-                Ok(()) => self.notify(format!(
-                    "Accepted proposal {}.",
-                    compact(&proposal.title, 42)
-                )),
-                Err(error) => {
-                    self.notify(format!("Accepted proposal, but refresh failed: {error}"))
-                }
-            },
-            Ok(other) => self.notify(format!(
-                "Proposal accept failed: unexpected response {other:?}"
-            )),
-            Err(error) => self.notify(format!("Proposal accept failed: {error}")),
         }
+        let proposal = self.proposals.remove(self.selected);
+        self.selected = self.selected.min(self.proposals.len().saturating_sub(1));
+        self.notify(format!(
+            "Accepted proposal {} locally.",
+            compact(&proposal.title, 42)
+        ));
     }
 
     fn reject_selected_proposal(&mut self) {
-        let Some(proposal) = self.selected_proposal().cloned() else {
+        if self.selected >= self.proposals.len() {
             return;
-        };
-        match self.client.request(RequestMethod::MemoryProposalReject {
-            id: proposal.id.clone(),
-        }) {
-            Ok(ResponsePayload::Mutation(_)) => match self.refresh() {
-                Ok(()) => self.notify(format!(
-                    "Rejected proposal {}.",
-                    compact(&proposal.title, 42)
-                )),
-                Err(error) => {
-                    self.notify(format!("Rejected proposal, but refresh failed: {error}"))
-                }
-            },
-            Ok(other) => self.notify(format!(
-                "Proposal reject failed: unexpected response {other:?}"
-            )),
-            Err(error) => self.notify(format!("Proposal reject failed: {error}")),
         }
+        let proposal = self.proposals.remove(self.selected);
+        self.selected = self.selected.min(self.proposals.len().saturating_sub(1));
+        self.notify(format!(
+            "Rejected proposal {} locally.",
+            compact(&proposal.title, 42)
+        ));
     }
 
     fn switch_selected_model(&mut self) {
@@ -917,6 +935,13 @@ impl App {
             self.notify("This model is unavailable.".to_string());
             return;
         }
+        if !model.id.starts_with("local:") {
+            self.notify(
+                "Cloud model switching is deferred to the backend model-router pass.".to_string(),
+            );
+            return;
+        }
+
         self.notify(format!(
             "Switching to {}...",
             compact(&model.display_name, 42)
@@ -986,21 +1011,90 @@ impl App {
             self.notify("Search query is empty.".to_string());
             return;
         }
-        match self.request_memory_search(&query) {
-            Ok(results) => {
-                self.search_results = results;
-                self.selected = 0;
-                self.notify(format!(
-                    "{} result(s). Scope: indexed memory.",
-                    self.search_results.len()
+        self.search_results = self.local_search(&query);
+        self.selected = 0;
+        self.notify(format!(
+            "{} result(s). Scope: tasks, reminders, proposals, chat.",
+            self.search_results.len()
+        ));
+    }
+
+    fn local_search(&self, query: &str) -> Vec<(String, String, f64)> {
+        let needle = query.to_ascii_lowercase();
+        let mut results = Vec::new();
+        for task in &self.tasks {
+            let haystack = format!("{} {}", task.title, task.body).to_ascii_lowercase();
+            if haystack.contains(&needle) {
+                let score = if task.title.to_ascii_lowercase().contains(&needle) {
+                    1.0
+                } else {
+                    0.72
+                };
+                results.push((
+                    format!("TASK: {}", task.id),
+                    format!("{} — {}", task.title, task.body),
+                    score,
                 ));
             }
-            Err(error) => {
-                self.search_results.clear();
-                self.selected = 0;
-                self.notify(format!("Search failed: {error}"));
+        }
+        for reminder in &self.reminders {
+            let haystack = format!("{} {}", reminder.title, reminder.body).to_ascii_lowercase();
+            if haystack.contains(&needle) {
+                let score = if reminder.title.to_ascii_lowercase().contains(&needle) {
+                    0.96
+                } else {
+                    0.68
+                };
+                results.push((
+                    format!("REMINDER: {}", reminder.id),
+                    format!("{} — {}", reminder.title, reminder.body),
+                    score,
+                ));
             }
         }
+        for proposal in &self.proposals {
+            let haystack = format!(
+                "{} {} {} {} {} {}",
+                proposal.title,
+                proposal.proposed_memory,
+                proposal.main_project,
+                proposal.sub_project,
+                proposal.affected_entity,
+                proposal.reason
+            )
+            .to_ascii_lowercase();
+            if haystack.contains(&needle) {
+                let score = if proposal.title.to_ascii_lowercase().contains(&needle) {
+                    0.92
+                } else {
+                    0.64
+                };
+                results.push((
+                    format!("PROPOSAL: {}", proposal.id),
+                    proposal.proposed_memory.clone(),
+                    score,
+                ));
+            }
+        }
+        for (index, exchange) in self.chat.iter().enumerate() {
+            let user = exchange.user.to_ascii_lowercase();
+            let assistant = exchange
+                .assistant
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if user.contains(&needle) || assistant.contains(&needle) {
+                results.push((format!("CHAT: {}", index + 1), exchange.user.clone(), 0.58));
+            }
+        }
+        results.sort_by(|left, right| {
+            right
+                .2
+                .partial_cmp(&left.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(left.0.cmp(&right.0))
+        });
+        results
     }
 
     fn send_chat(&mut self) {
@@ -1380,75 +1474,47 @@ impl App {
                 }
             }
             FormKind::Reminder => {
-                let due = if due.trim().is_empty() {
-                    None
-                } else {
-                    Some(due)
-                };
-                let editing_id = form.editing_id.clone();
-                let was_editing = editing_id.is_some();
-                let mutation = if let Some(id) = editing_id.clone() {
-                    RequestMethod::RemindersMutate {
-                        operation: "update".to_string(),
-                        id: Some(id),
-                        title: Some(title),
-                        body: Some(body),
-                        due: Some(due),
+                let due_at = (!due.trim().is_empty()).then_some(due);
+                let now = task_timestamp();
+                if let Some(id) = form.editing_id.as_deref() {
+                    if let Some(reminder) =
+                        self.reminders.iter_mut().find(|reminder| reminder.id == id)
+                    {
+                        reminder.title = title;
+                        reminder.body = body;
+                        reminder.due_at = due_at;
+                        reminder.updated_at = now;
+                        sort_ui_reminders(&mut self.reminders);
+                        self.selected = self
+                            .reminders
+                            .iter()
+                            .position(|reminder| reminder.id == id)
+                            .unwrap_or(0);
+                        self.form = None;
+                        self.notify("Reminder updated locally.".to_string());
+                    } else if let Some(active) = self.form.as_mut() {
+                        active.validation_error =
+                            Some("Selected reminder no longer exists.".to_string());
                     }
                 } else {
-                    RequestMethod::RemindersMutate {
-                        operation: "create".to_string(),
-                        id: None,
-                        title: Some(title),
-                        body: Some(body),
-                        due: Some(due),
-                    }
-                };
-
-                match self.client.request(mutation) {
-                    Ok(ResponsePayload::Mutation(result)) => {
-                        let backend_id = result
-                            .output
-                            .get("id")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string);
-                        match self.refresh() {
-                            Ok(()) => {
-                                let selected_id = editing_id.or(backend_id);
-                                if let Some(id) = selected_id.as_deref() {
-                                    self.selected = self
-                                        .reminders
-                                        .iter()
-                                        .position(|reminder| reminder.id == id)
-                                        .unwrap_or(0);
-                                }
-                                self.form = None;
-                                self.notify(if was_editing {
-                                    "Reminder updated in backend.".to_string()
-                                } else {
-                                    "Reminder created in backend.".to_string()
-                                });
-                            }
-                            Err(error) => {
-                                if let Some(active) = self.form.as_mut() {
-                                    active.validation_error =
-                                        Some(format!("Saved, but refresh failed: {error}"));
-                                }
-                            }
-                        }
-                    }
-                    Ok(other) => {
-                        if let Some(active) = self.form.as_mut() {
-                            active.validation_error =
-                                Some(format!("Unexpected reminder mutation response: {other:?}"));
-                        }
-                    }
-                    Err(error) => {
-                        if let Some(active) = self.form.as_mut() {
-                            active.validation_error =
-                                Some(format!("Reminder save failed: {error}"));
-                        }
-                    }
+                    let id = format!("local-reminder-{}", self.reminders.len() + 1);
+                    self.reminders.push(UiReminder {
+                        id: id.clone(),
+                        title,
+                        body,
+                        status: "scheduled".into(),
+                        due_at,
+                        created_at: now.clone(),
+                        updated_at: now,
+                    });
+                    sort_ui_reminders(&mut self.reminders);
+                    self.selected = self
+                        .reminders
+                        .iter()
+                        .position(|reminder| reminder.id == id)
+                        .unwrap_or(0);
+                    self.form = None;
+                    self.notify("Reminder created locally.".to_string());
                 }
             }
         }
@@ -1580,37 +1646,27 @@ impl App {
                     return;
                 };
                 let id = reminder.id.clone();
-                let operation = if matches!(action, ConfirmAction::CompleteReminder) {
-                    "complete"
+                let status = if matches!(action, ConfirmAction::CompleteReminder) {
+                    "completed"
                 } else {
-                    "cancel"
+                    "cancelled"
                 };
-                match self.client.request(RequestMethod::RemindersMutate {
-                    operation: operation.to_string(),
-                    id: Some(id.clone()),
-                    title: None,
-                    body: None,
-                    due: None,
-                }) {
-                    Ok(ResponsePayload::Mutation(_)) => match self.refresh() {
-                        Ok(()) => {
-                            self.notify(if operation == "complete" {
-                                "Reminder completed in backend.".to_string()
-                            } else {
-                                "Reminder cancelled in backend.".to_string()
-                            });
-                        }
-                        Err(error) => self.notify(format!(
-                            "Reminder {} in backend, refresh failed: {error}",
-                            operation
-                        )),
-                    },
-                    Ok(other) => {
-                        self.notify(format!("Unexpected reminder mutation response: {other:?}"))
-                    }
-                    Err(error) => self.notify(format!("Reminder {} failed: {error}", operation)),
+                if let Some(item) = self.reminders.iter_mut().find(|item| item.id == id) {
+                    item.status = status.to_string();
+                    item.updated_at = task_timestamp();
                 }
+                sort_ui_reminders(&mut self.reminders);
+                self.selected = self
+                    .reminders
+                    .iter()
+                    .position(|item| item.id == id)
+                    .unwrap_or(0);
                 self.modal = None;
+                self.notify(if status == "completed" {
+                    "Reminder completed locally.".to_string()
+                } else {
+                    "Reminder cancelled locally.".to_string()
+                });
             }
             ConfirmAction::RelaunchRuntime => self.relaunch_runtime(),
         }
@@ -2032,7 +2088,6 @@ impl App {
 
     fn open_selected_detail(&mut self) {
         self.modal = match self.tab {
-            Tab::Overview => overview_detail_modal(self.overview_rows().get(self.selected)),
             Tab::Tasks if self.selected_task_index().is_some() => Some(Modal::TaskDetail),
             Tab::Reminders if self.selected_reminder_index().is_some() => {
                 Some(Modal::ReminderDetail)
@@ -2456,9 +2511,7 @@ impl App {
         }
 
         if items.is_empty() {
-            items.push(ListItem::new(Line::from(
-                "No tasks yet. Press c to create one.",
-            )));
+            items.push(ListItem::new(Line::from("No demo tasks configured.")));
         }
 
         let mut state = ListState::default();
@@ -2845,7 +2898,7 @@ impl App {
         self.last_layout.input = vertical[0];
         let lines = if self.search_results.is_empty() {
             vec![Line::from(if self.search_input.is_empty() {
-                "Press / to search indexed memory."
+                "Press / to search tasks, reminders, proposals and chat."
             } else {
                 "No results."
             })]
@@ -2997,7 +3050,6 @@ fn form_title(form: &FormState) -> String {
     }
 }
 
-#[cfg(test)]
 fn task_timestamp() -> String {
     let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
     format!(
@@ -3060,7 +3112,7 @@ fn form_lines(form: &FormState, width: usize) -> Vec<Line<'static>> {
                 spans.push(Span::styled("▏", style));
             }
             spans.push(Span::styled(
-                "DD/MM/YYYY hh:mm (09:00 default)",
+                "e.g. tomorrow 4 PM",
                 Style::default().fg(Color::DarkGray),
             ));
             lines.push(Line::from(spans));
@@ -3200,40 +3252,23 @@ fn modal_lines(app: &App, modal: Modal, width: usize) -> Vec<Line<'static>> {
         }
         Modal::ProposalDetail => {
             if let Some(proposal) = app.selected_proposal() {
-                let tags = if proposal.tags.is_empty() {
-                    "None".to_string()
-                } else {
-                    proposal.tags.join(", ")
-                };
                 return detail_lines(
                     vec![
                         format!("Title: {}", proposal_title(proposal)),
                         format!("Created: {}", proposal.created_at),
-                        format!("Updated: {}", proposal.updated_at),
                         format!(
                             "Recommended decision: {}",
                             proposal_decision_label(&proposal.decision)
                         ),
-                        format!("Status: {}", proposal.status),
                         format!("Conversation turn: {}", proposal.conversation_turn_id),
-                        format!("Proposal items: {}", proposal.item_count),
                         String::new(),
                         "Proposed memory".to_string(),
-                        if proposal.proposed_memory.trim().is_empty() {
-                            "No proposal text available.".to_string()
-                        } else {
-                            proposal.proposed_memory.clone()
-                        },
+                        proposal.proposed_memory.clone(),
                         String::new(),
-                        format!(
-                            "Item kind: {}",
-                            if proposal.item_kind.trim().is_empty() {
-                                "unknown"
-                            } else {
-                                proposal.item_kind.as_str()
-                            }
-                        ),
-                        format!("Tags: {tags}"),
+                        format!("Main project: {}", proposal.main_project),
+                        format!("Sub-project: {}", proposal.sub_project),
+                        format!("Affected entity: {}", proposal.affected_entity),
+                        format!("Reason: {}", proposal.reason),
                     ],
                     width,
                     "Esc close | a accept | x reject",
@@ -3660,11 +3695,36 @@ fn proposal_title(proposal: &UiProposal) -> String {
     }
 }
 
-fn proposal_created_at(proposal: &UiProposal) -> String {
-    if proposal.created_at.trim().is_empty() {
-        "--".to_string()
+fn proposal_created_at(id: &str) -> String {
+    let Some(stamp) = id.strip_prefix("proposal-") else {
+        return "--".to_string();
+    };
+    let Some((date, time_and_rest)) = stamp.split_once('T') else {
+        return "--".to_string();
+    };
+    let mut date_parts = date.split('-');
+    let year = date_parts.next().unwrap_or("");
+    let month = date_parts.next().unwrap_or("");
+    let day = date_parts.next().unwrap_or("");
+    if year.len() != 4 || month.len() != 2 || day.len() != 2 {
+        return "--".to_string();
+    }
+    let time_digits = time_and_rest
+        .strip_suffix('Z')
+        .unwrap_or(time_and_rest)
+        .chars()
+        .take(6)
+        .collect::<String>();
+    if time_digits.len() == 6 {
+        format!(
+            "{day}-{month}-{} {}:{}:{}",
+            &year[2..],
+            &time_digits[0..2],
+            &time_digits[2..4],
+            &time_digits[4..6]
+        )
     } else {
-        proposal.created_at.clone()
+        format!("{day}-{month}-{}", &year[2..])
     }
 }
 
@@ -3719,7 +3779,7 @@ fn proposal_list_line(proposal: &UiProposal, width: usize, mode: LayoutMode) -> 
     let date_width = if mode == LayoutMode::Mini { 8 } else { 17 };
     let decision = proposal_decision_label(&proposal.decision);
     let title = compact(&proposal_title(proposal), title_width);
-    let date = compact(&proposal_created_at(proposal), date_width);
+    let date = compact(&proposal_created_at(&proposal.id), date_width);
     Line::from(format!(
         "{:<title_width$}  {:<date_width$}  {}",
         title,
@@ -3731,6 +3791,14 @@ fn proposal_list_line(proposal: &UiProposal, width: usize, mode: LayoutMode) -> 
         title_width = title_width,
         date_width = date_width,
     ))
+}
+
+fn model_location(model: &UiModel) -> &'static str {
+    if model.id == "qwen" || model.id.starts_with("local:") {
+        "LOCAL"
+    } else {
+        "CLOUD"
+    }
 }
 
 fn model_state_style(active: bool, available: bool) -> Style {
@@ -3766,22 +3834,6 @@ fn job_rank(status: &str) -> u8 {
     }
 }
 
-fn ui_model_from_backend(model: assistant_protocol::ModelInfo) -> UiModel {
-    UiModel {
-        id: model.id,
-        display_name: model.display_name,
-        available: model.available,
-        active: model.active,
-        capabilities: model.capabilities,
-        location: "LOCAL".to_string(),
-        endpoint: "n/a".to_string(),
-        context: "n/a".to_string(),
-        vram: "n/a".to_string(),
-        pid: "n/a".to_string(),
-        speed: "n/a".to_string(),
-    }
-}
-
 fn ui_task_from_backend(task: assistant_protocol::TaskSummary) -> UiTask {
     UiTask {
         id: task.id,
@@ -3806,73 +3858,17 @@ fn ui_task_from_backend(task: assistant_protocol::TaskSummary) -> UiTask {
     }
 }
 
-fn ui_reminder_from_backend(reminder: assistant_protocol::ReminderSummary) -> UiReminder {
-    UiReminder {
-        id: reminder.id,
-        title: reminder.title,
-        body: reminder.body,
-        status: reminder.status,
-        due_at: reminder
-            .due_at
-            .and_then(|value| format_backend_timestamp(&value)),
-        created_at: reminder
-            .created_at
-            .as_deref()
-            .and_then(format_backend_timestamp)
-            .unwrap_or_default(),
-        updated_at: reminder
-            .updated_at
-            .as_deref()
-            .and_then(format_backend_timestamp)
-            .unwrap_or_default(),
-    }
-}
-
-fn ui_proposal_from_backend(proposal: assistant_protocol::MemoryProposalSummary) -> UiProposal {
-    UiProposal {
-        id: proposal.id,
-        title: proposal.title,
-        created_at: format_backend_timestamp(&proposal.created_at).unwrap_or(proposal.created_at),
-        updated_at: format_backend_timestamp(&proposal.updated_at).unwrap_or(proposal.updated_at),
-        decision: proposal.decision,
-        status: proposal.status,
-        conversation_turn_id: proposal.conversation_turn_id,
-        proposed_memory: proposal.proposed_memory,
-        item_kind: proposal.item_kind,
-        tags: proposal.tags,
-        item_count: proposal.item_count,
-    }
-}
-
-fn ui_job_from_backend(job: assistant_protocol::JobSummary) -> UiJob {
-    UiJob {
-        id: job.id,
-        job_type: job.job_type,
-        status: job.status,
-        next_run_at: job.next_run_at,
-    }
-}
-
-fn ui_search_result_from_backend(
-    result: assistant_protocol::MemorySummary,
-) -> (String, String, f64) {
-    (result.id, result.text, result.score)
-}
-
 fn format_backend_timestamp(value: &str) -> Option<String> {
     let parsed = OffsetDateTime::parse(value, &Rfc3339).ok()?;
     let local = parsed.to_offset(UtcOffset::current_local_offset().ok()?);
     local
         .format(
-            &time::format_description::parse_borrowed::<1>(
-                "[day]-[month]-[year repr:last_two] [hour]:[minute]",
-            )
-            .ok()?,
+            &time::format_description::parse("[day]-[month]-[year repr:last_two] [hour]:[minute]")
+                .ok()?,
         )
         .ok()
 }
 
-#[cfg(test)]
 fn set_local_task_status(tasks: &mut [UiTask], id: &str, status: &str) -> bool {
     let Some(task) = tasks.iter_mut().find(|task| task.id == id) else {
         return false;
@@ -4346,35 +4342,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     execute!(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
-        ResetKeyboardEnhancementFlags,
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
-    terminal.backend_mut().flush()?;
     terminal.show_cursor()?;
     result
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ResetKeyboardEnhancementFlags;
-
-impl Command for ResetKeyboardEnhancementFlags {
-    fn write_ansi(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
-        out.write_str("\x1b[<u")
-    }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> std::io::Result<()> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "keyboard enhancement reset is not implemented for the legacy Windows API",
-        ))
-    }
-
-    #[cfg(windows)]
-    fn is_ansi_code_supported(&self) -> bool {
-        false
-    }
 }
 
 enum StartupOutcome {
@@ -4501,14 +4473,6 @@ fn draw_startup(
     }
 }
 
-fn overview_detail_modal(row: Option<&RowKind>) -> Option<Modal> {
-    match row {
-        Some(RowKind::Task(_)) => Some(Modal::TaskDetail),
-        Some(RowKind::Reminder(_)) => Some(Modal::ReminderDetail),
-        None => None,
-    }
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
     run()
 }
@@ -4535,28 +4499,6 @@ mod tests {
             LayoutMode::for_area(Rect::new(0, 0, 49, 20)),
             LayoutMode::TooSmall
         );
-    }
-
-    #[test]
-    fn overview_selected_row_maps_to_detail_modal() {
-        assert_eq!(
-            overview_detail_modal(Some(&RowKind::Task(0))),
-            Some(Modal::TaskDetail)
-        );
-        assert_eq!(
-            overview_detail_modal(Some(&RowKind::Reminder(0))),
-            Some(Modal::ReminderDetail)
-        );
-        assert_eq!(overview_detail_modal(None), None);
-    }
-
-    #[test]
-    fn reset_keyboard_enhancement_flags_writes_terminal_reset_sequence() {
-        let mut output = String::new();
-        ResetKeyboardEnhancementFlags
-            .write_ansi(&mut output)
-            .unwrap();
-        assert_eq!(output, "\x1b[<u");
     }
 
     #[test]
@@ -4677,69 +4619,6 @@ mod tests {
     }
 
     #[test]
-    fn backend_reminder_summary_maps_to_ui_reminder() {
-        let reminder = ui_reminder_from_backend(assistant_protocol::ReminderSummary {
-            id: "reminder:test".to_string(),
-            title: "Review report".to_string(),
-            body: "Send notes.".to_string(),
-            status: "scheduled".to_string(),
-            due_at: Some("2026-09-24T04:00:00Z".to_string()),
-            created_at: Some("2026-09-21T10:00:00Z".to_string()),
-            updated_at: Some("2026-09-21T11:00:00Z".to_string()),
-        });
-        assert_eq!(reminder.id, "reminder:test");
-        assert_eq!(reminder.title, "Review report");
-        assert_eq!(reminder.body, "Send notes.");
-        assert_eq!(reminder.status, "scheduled");
-        assert!(reminder.due_at.is_some());
-        assert!(!reminder.created_at.is_empty());
-        assert!(!reminder.updated_at.is_empty());
-    }
-
-    #[test]
-    fn backend_proposal_summary_maps_to_ui_proposal() {
-        let proposal = ui_proposal_from_backend(assistant_protocol::MemoryProposalSummary {
-            id: "proposal:test".to_string(),
-            decision: "should_save".to_string(),
-            conversation_turn_id: "42".to_string(),
-            status: "pending".to_string(),
-            created_at: "2026-09-21T12:00:00Z".to_string(),
-            updated_at: "2026-09-21T12:05:00Z".to_string(),
-            title: "Runtime architecture".to_string(),
-            proposed_memory: "Zaraki uses a Rust runtime.".to_string(),
-            item_kind: "fact".to_string(),
-            tags: vec!["Zaraki".to_string(), "runtime".to_string()],
-            item_count: 1,
-        });
-        assert_eq!(proposal.id, "proposal:test");
-        assert_eq!(proposal.title, "Runtime architecture");
-        assert_eq!(proposal.decision, "should_save");
-        assert_eq!(proposal.status, "pending");
-        assert_eq!(proposal.item_kind, "fact");
-        assert_eq!(
-            proposal.tags,
-            vec!["Zaraki".to_string(), "runtime".to_string()]
-        );
-        assert_eq!(proposal.item_count, 1);
-        assert!(!proposal.created_at.is_empty());
-        assert!(!proposal.updated_at.is_empty());
-    }
-
-    #[test]
-    fn backend_job_summary_maps_to_ui_job() {
-        let job = ui_job_from_backend(assistant_protocol::JobSummary {
-            id: "job:test".to_string(),
-            job_type: "memory extraction".to_string(),
-            status: "running".to_string(),
-            next_run_at: "now".to_string(),
-        });
-        assert_eq!(job.id, "job:test");
-        assert_eq!(job.job_type, "memory extraction");
-        assert_eq!(job.status, "running");
-        assert_eq!(job.next_run_at, "now");
-    }
-
-    #[test]
     fn task_form_defaults_are_backend_neutral() {
         let form = FormState::task_create();
         assert_eq!(form.values, vec!["", "", "", "open", "medium", ""]);
@@ -4778,7 +4657,7 @@ mod tests {
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert!(rendered.contains("DD/MM/YYYY hh:mm (09:00 default)"));
+        assert!(rendered.contains("e.g. tomorrow 4 PM"));
         assert!(form.values[2].is_empty());
     }
 
@@ -4846,26 +4725,21 @@ mod tests {
     }
 
     #[test]
-    fn backend_model_summary_maps_without_invented_diagnostics() {
-        let model = ui_model_from_backend(assistant_protocol::ModelInfo {
+    fn model_location_marks_qwen_as_local() {
+        let model = UiModel {
             id: "qwen".to_string(),
             display_name: "Qwen3.5-4B-Q4_K_M.gguf".to_string(),
             available: true,
             active: true,
-            capabilities: vec!["controller".to_string(), "general_response".to_string()],
-        });
-
-        assert_eq!(model.id, "qwen");
-        assert_eq!(model.display_name, "Qwen3.5-4B-Q4_K_M.gguf");
-        assert!(model.available);
-        assert!(model.active);
-        assert_eq!(model.capabilities, vec!["controller", "general_response"]);
-        assert_eq!(model.location, "LOCAL");
-        assert_eq!(model.endpoint, "n/a");
-        assert_eq!(model.context, "n/a");
-        assert_eq!(model.vram, "n/a");
-        assert_eq!(model.pid, "n/a");
-        assert_eq!(model.speed, "n/a");
+            capabilities: vec!["controller".to_string()],
+            location: "LOCAL".to_string(),
+            endpoint: "127.0.0.1:8080".to_string(),
+            context: "4096".to_string(),
+            vram: "3 GiB".to_string(),
+            pid: "demo".to_string(),
+            speed: "demo".to_string(),
+        };
+        assert_eq!(model_location(&model), "LOCAL");
     }
 
     #[test]
@@ -4922,21 +4796,12 @@ mod tests {
     }
 
     #[test]
-    fn proposal_created_at_uses_backend_timestamp() {
-        let proposal = UiProposal {
-            id: "proposal-1".into(),
-            title: "Backend proposal".into(),
-            created_at: "14-09-26 18:29:28".into(),
-            updated_at: "14-09-26 18:29:28".into(),
-            decision: "should_save".into(),
-            status: "pending".into(),
-            conversation_turn_id: "24".into(),
-            proposed_memory: "memory".into(),
-            item_kind: "fact".into(),
-            tags: vec!["Zaraki".into()],
-            item_count: 1,
-        };
-        assert_eq!(proposal_created_at(&proposal), "14-09-26 18:29:28");
+    fn proposal_created_at_is_readable_from_id() {
+        assert_eq!(
+            proposal_created_at("proposal-2026-09-14T1829286885250217Z-239514-3"),
+            "14-09-26 18:29:28"
+        );
+        assert_eq!(proposal_created_at("bad-id"), "--");
     }
 
     #[test]
@@ -4950,21 +4815,20 @@ mod tests {
     }
 
     #[test]
-    fn proposal_title_uses_backend_title() {
+    fn proposal_title_uses_local_frontend_title() {
         let proposal = UiProposal {
             id: "proposal-1".into(),
-            title: "Backend proposal".into(),
+            title: "Frontend proposal".into(),
             created_at: "21-09-26 12:40".into(),
-            updated_at: "21-09-26 12:40".into(),
             decision: "pending".into(),
-            status: "pending".into(),
             conversation_turn_id: "24".into(),
             proposed_memory: "memory".into(),
-            item_kind: "fact".into(),
-            tags: vec!["Zaraki".into()],
-            item_count: 1,
+            main_project: "Zaraki".into(),
+            sub_project: "TUI".into(),
+            affected_entity: "frontend".into(),
+            reason: "useful".into(),
         };
-        assert_eq!(proposal_title(&proposal), "Backend proposal");
+        assert_eq!(proposal_title(&proposal), "Frontend proposal");
     }
 
     #[test]
