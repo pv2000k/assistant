@@ -24,10 +24,13 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
+    },
 };
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
@@ -459,6 +462,7 @@ struct UiRects {
     footer: Rect,
     list: Rect,
     input: Rect,
+    modal: Rect,
 }
 
 struct App {
@@ -482,6 +486,8 @@ struct App {
     chat_cursor: usize,
     chat_scroll: u16,
     input_scroll: u16,
+    modal_scroll: u16,
+    list_scroll: usize,
     search_input: String,
     search_cursor: usize,
     search_results: Vec<(String, String, f64)>,
@@ -528,6 +534,8 @@ impl App {
             chat_cursor: 0,
             chat_scroll: 0,
             input_scroll: 0,
+            modal_scroll: 0,
+            list_scroll: 0,
             search_input: String::new(),
             search_cursor: 0,
             search_results: Vec::new(),
@@ -544,6 +552,7 @@ impl App {
                 footer: Rect::default(),
                 list: Rect::default(),
                 input: Rect::default(),
+                modal: Rect::default(),
             },
         }
     }
@@ -729,6 +738,8 @@ impl App {
         self.modal = None;
         self.form = None;
         self.message.clear();
+        self.list_scroll = 0;
+        self.modal_scroll = 0;
         if tab == Tab::Search && !self.search_input.trim().is_empty() {
             self.run_search();
         }
@@ -1952,6 +1963,10 @@ impl App {
             },
             Modal::TaskDetail => match key.code {
                 KeyCode::Esc | KeyCode::Enter => self.modal = None,
+                KeyCode::Up => self.modal_scroll = self.modal_scroll.saturating_sub(1),
+                KeyCode::Down => self.modal_scroll = self.modal_scroll.saturating_add(1),
+                KeyCode::PageUp => self.modal_scroll = self.modal_scroll.saturating_sub(8),
+                KeyCode::PageDown => self.modal_scroll = self.modal_scroll.saturating_add(8),
                 KeyCode::Char('e') => {
                     self.modal = None;
                     self.open_task_form(true);
@@ -1962,6 +1977,10 @@ impl App {
             },
             Modal::ReminderDetail => match key.code {
                 KeyCode::Esc | KeyCode::Enter => self.modal = None,
+                KeyCode::Up => self.modal_scroll = self.modal_scroll.saturating_sub(1),
+                KeyCode::Down => self.modal_scroll = self.modal_scroll.saturating_add(1),
+                KeyCode::PageUp => self.modal_scroll = self.modal_scroll.saturating_sub(8),
+                KeyCode::PageDown => self.modal_scroll = self.modal_scroll.saturating_add(8),
                 KeyCode::Char('e') => {
                     self.modal = None;
                     self.open_reminder_form(true);
@@ -1974,6 +1993,10 @@ impl App {
             },
             Modal::ProposalDetail => match key.code {
                 KeyCode::Esc | KeyCode::Enter => self.modal = None,
+                KeyCode::Up => self.modal_scroll = self.modal_scroll.saturating_sub(1),
+                KeyCode::Down => self.modal_scroll = self.modal_scroll.saturating_add(1),
+                KeyCode::PageUp => self.modal_scroll = self.modal_scroll.saturating_sub(8),
+                KeyCode::PageDown => self.modal_scroll = self.modal_scroll.saturating_add(8),
                 KeyCode::Char('a') => {
                     self.modal = None;
                     self.accept_selected_proposal();
@@ -1986,6 +2009,10 @@ impl App {
             },
             Modal::SearchDetail => match key.code {
                 KeyCode::Esc | KeyCode::Enter => self.modal = None,
+                KeyCode::Up => self.modal_scroll = self.modal_scroll.saturating_sub(1),
+                KeyCode::Down => self.modal_scroll = self.modal_scroll.saturating_add(1),
+                KeyCode::PageUp => self.modal_scroll = self.modal_scroll.saturating_sub(8),
+                KeyCode::PageDown => self.modal_scroll = self.modal_scroll.saturating_add(8),
                 _ => {}
             },
         }
@@ -2041,29 +2068,56 @@ impl App {
             Tab::Search if self.selected_search().is_some() => Some(Modal::SearchDetail),
             _ => None,
         };
+        self.modal_scroll = 0;
     }
 
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
-        if matches!(mouse.kind, MouseEventKind::ScrollUp) {
-            if self.tab == Tab::Chat {
-                self.chat_scroll = self.chat_scroll.saturating_sub(3);
+        let point = (mouse.column, mouse.row);
+
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                -1
             } else {
-                self.move_selection(-3);
+                1
+            };
+            if self.modal.is_some() {
+                if rect_contains(self.last_layout.modal, point.0, point.1) {
+                    self.modal_scroll = if delta < 0 {
+                        self.modal_scroll.saturating_sub(3)
+                    } else {
+                        self.modal_scroll.saturating_add(3)
+                    };
+                }
+                return;
+            }
+            if self.tab == Tab::Chat && rect_contains(self.last_layout.list, point.0, point.1) {
+                self.chat_scroll = if delta < 0 {
+                    self.chat_scroll.saturating_sub(3)
+                } else {
+                    self.chat_scroll.saturating_add(3)
+                };
+                return;
+            }
+            if self.tab == Tab::Chat && rect_contains(self.last_layout.input, point.0, point.1) {
+                self.input_scroll = if delta < 0 {
+                    self.input_scroll.saturating_sub(1)
+                } else {
+                    self.input_scroll.saturating_add(1)
+                };
+                return;
+            }
+            if rect_contains(self.last_layout.list, point.0, point.1) {
+                self.move_selection(if delta < 0 { -3 } else { 3 });
             }
             return;
         }
-        if matches!(mouse.kind, MouseEventKind::ScrollDown) {
-            if self.tab == Tab::Chat {
-                self.chat_scroll = self.chat_scroll.saturating_add(3);
-            } else {
-                self.move_selection(3);
-            }
-            return;
-        }
+
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return;
         }
-        let point = (mouse.column, mouse.row);
         if rect_contains(self.last_layout.header, point.0, point.1) {
             if let Some(tab) = tab_from_mouse(point.0, point.1, self.last_layout.header) {
                 self.set_tab(tab);
@@ -2094,7 +2148,11 @@ impl App {
     }
 
     fn list_index_from_mouse(&self, y: u16) -> Option<usize> {
-        let row = y.checked_sub(self.last_layout.list.y + 1)? as usize;
+        let content_y = match self.tab {
+            Tab::Overview | Tab::Models | Tab::Search => self.last_layout.list.y.saturating_add(1),
+            _ => self.last_layout.list.y,
+        };
+        let row = y.checked_sub(content_y)? as usize + self.list_scroll;
         match self.tab {
             Tab::Tasks => indexed_grouped_row(
                 &self
@@ -2179,6 +2237,7 @@ impl App {
             footer: vertical[2],
             list: vertical[1],
             input: Rect::default(),
+            modal: Rect::default(),
         };
         self.last_layout = rects;
         self.draw_header(frame, vertical[0], mode);
@@ -2199,7 +2258,7 @@ impl App {
                 Line::from("Terminal too small for Zaraki."),
                 Line::from("Resize the terminal to continue."),
             ])
-            .block(Block::default().borders(Borders::ALL)),
+            .block(panel_block("Zaraki")),
             area,
         );
     }
@@ -2231,7 +2290,12 @@ impl App {
             "⚠ runtime disconnected"
         };
         lines.push(Line::from(vec![
-            Span::styled("Zaraki", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Zaraki",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
             Span::styled(runtime_text, runtime_style),
         ]));
@@ -2242,7 +2306,11 @@ impl App {
             lines.truncate(area.height.saturating_sub(2) as usize);
         }
         frame.render_widget(
-            Paragraph::new(lines).block(Block::default().borders(Borders::BOTTOM)),
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(panel_border_style()),
+            ),
             area,
         );
     }
@@ -2305,7 +2373,11 @@ impl App {
             compact(&format!("{}  {}", left, right), width)
         };
         frame.render_widget(
-            Paragraph::new(text).block(Block::default().borders(Borders::TOP)),
+            Paragraph::new(text).block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(panel_border_style()),
+            ),
             area,
         );
     }
@@ -2323,10 +2395,7 @@ impl App {
             ])
             .split(area);
 
-        let mut focus_lines = vec![Line::from(Span::styled(
-            "Today's Focus",
-            Style::default().add_modifier(Modifier::BOLD),
-        ))];
+        let mut focus_lines = Vec::new();
         let focus_tasks = self
             .tasks
             .iter()
@@ -2350,21 +2419,27 @@ impl App {
                 compact(&reminder.title, inner_width(sections[0]).saturating_sub(4))
             )));
         }
-        if focus_lines.len() == 1 {
-            focus_lines.push(Line::from("□  No active focus items."));
+        if focus_lines.is_empty() {
+            focus_lines.push(Line::from(Span::styled(
+                "□  No active focus items.",
+                muted_style(),
+            )));
         }
-        focus_lines.push(Line::from("🔥 completed   □ current   ·̥ past incomplete"));
+        if !focus_lines.is_empty() {
+            focus_lines.push(Line::from(""));
+            focus_lines.push(Line::from(Span::styled(
+                "Enter opens details",
+                muted_style(),
+            )));
+        }
         frame.render_widget(
             Paragraph::new(focus_lines)
-                .block(Block::default().borders(Borders::ALL).title("Focus"))
+                .block(panel_block("Today's focus"))
                 .wrap(Wrap { trim: true }),
             sections[0],
         );
 
-        let mut lines = vec![Line::from(Span::styled(
-            "Important / pending",
-            Style::default().add_modifier(Modifier::BOLD),
-        ))];
+        let mut lines = Vec::new();
         let max_items = if mode == LayoutMode::Mini { 5 } else { 10 };
         let overview_rows = self.overview_rows();
         for (row_index, row) in overview_rows.iter().take(max_items).enumerate() {
@@ -2394,33 +2469,49 @@ impl App {
             lines.push(Line::from(spans));
         }
         if lines.len() == 1 {
-            lines.push(Line::from("Nothing pending."));
+            lines.push(Line::from(Span::styled("Nothing pending.", muted_style())));
         }
         frame.render_widget(
             Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Today & Important"),
-                )
+                .block(panel_block("Today & Important"))
                 .wrap(Wrap { trim: true }),
             sections[1],
         );
 
         frame.render_widget(
             Paragraph::new(vec![Line::from(format!(
-                "⚠ {} memory proposal(s) pending review",
+                "{} proposal(s) pending review",
                 self.proposals.len()
             ))])
-            .block(Block::default().borders(Borders::ALL).title("Memory"))
+            .block(panel_block("Memory"))
             .wrap(Wrap { trim: true }),
             sections[2],
         );
         self.last_layout.list = sections[1];
     }
 
+    fn tasks_visual_item_count(&self) -> usize {
+        grouped_visual_item_count(
+            &self
+                .tasks
+                .iter()
+                .map(|task| task.status.as_str())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn reminders_visual_item_count(&self) -> usize {
+        grouped_visual_item_count(
+            &self
+                .reminders
+                .iter()
+                .map(|reminder| reminder.status.as_str())
+                .collect::<Vec<_>>(),
+        )
+    }
+
     fn draw_tasks(&mut self, frame: &mut Frame, area: Rect, mode: LayoutMode) {
-        let block = Block::default().borders(Borders::ALL).title("Tasks");
+        let block = panel_block("Tasks");
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -2445,7 +2536,7 @@ impl App {
                 let label = task_status_group_label(&task.status);
                 items.push(ListItem::new(Line::from(Span::styled(
                     format!("▸ {label}"),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    section_style(),
                 ))));
                 last_status = Some(task.status.as_str());
             }
@@ -2456,20 +2547,30 @@ impl App {
         }
 
         if items.is_empty() {
-            items.push(ListItem::new(Line::from(
+            items.push(ListItem::new(Line::from(Span::styled(
                 "No tasks yet. Press c to create one.",
-            )));
+                muted_style(),
+            ))));
         }
 
         let mut state = ListState::default();
         state.select(selected_item);
-        let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::BOLD));
+        let list = List::new(items).highlight_style(selected_row_style());
         frame.render_stateful_widget(list, list_area, &mut state);
-        self.last_layout.list = area;
+        self.list_scroll = state.offset();
+        render_vertical_scrollbar(
+            frame,
+            list_area,
+            state.offset(),
+            self.tasks_visual_item_count(),
+            list_area.height as usize,
+            false,
+        );
+        self.last_layout.list = list_area;
     }
 
     fn draw_reminders(&mut self, frame: &mut Frame, area: Rect, mode: LayoutMode) {
-        let block = Block::default().borders(Borders::ALL).title("Reminders");
+        let block = panel_block("Reminders");
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let header = reminder_header_line(inner.width as usize, mode);
@@ -2490,7 +2591,7 @@ impl App {
             if last_status != Some(reminder.status.as_str()) {
                 items.push(ListItem::new(Line::from(Span::styled(
                     format!("▸ {}", reminder_status_group_label(&reminder.status)),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    section_style(),
                 ))));
                 last_status = Some(reminder.status.as_str());
             }
@@ -2504,28 +2605,42 @@ impl App {
             )));
         }
         if items.is_empty() {
-            items.push(ListItem::new(Line::from(
+            items.push(ListItem::new(Line::from(Span::styled(
                 "No reminders yet. Press c to create one.",
-            )));
+                muted_style(),
+            ))));
         }
         let mut state = ListState::default();
         state.select(selected_item);
         frame.render_stateful_widget(
-            List::new(items).highlight_style(Style::default().add_modifier(Modifier::BOLD)),
+            List::new(items).highlight_style(selected_row_style()),
             list_area,
             &mut state,
         );
-        self.last_layout.list = area;
+        self.list_scroll = state.offset();
+        render_vertical_scrollbar(
+            frame,
+            list_area,
+            state.offset(),
+            self.reminders_visual_item_count(),
+            list_area.height as usize,
+            false,
+        );
+        self.last_layout.list = list_area;
     }
 
     fn draw_proposals(&mut self, frame: &mut Frame, area: Rect, mode: LayoutMode) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title("Memory proposals");
+        let block = panel_block("Memory proposals");
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if self.proposals.is_empty() {
-            frame.render_widget(Paragraph::new("No memory proposals pending review."), inner);
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "No memory proposals pending review.",
+                    muted_style(),
+                )),
+                inner,
+            );
             self.last_layout.list = area;
             return;
         }
@@ -2548,9 +2663,18 @@ impl App {
         let mut state = ListState::default();
         state.select(Some(self.selected.min(items.len().saturating_sub(1))));
         frame.render_stateful_widget(
-            List::new(items).highlight_style(Style::default().add_modifier(Modifier::BOLD)),
+            List::new(items).highlight_style(selected_row_style()),
             list_area,
             &mut state,
+        );
+        self.list_scroll = state.offset();
+        render_vertical_scrollbar(
+            frame,
+            list_area,
+            state.offset(),
+            self.proposals.len(),
+            list_area.height as usize,
+            false,
         );
         self.last_layout.list = list_area;
     }
@@ -2564,6 +2688,7 @@ impl App {
             .constraints([Constraint::Min(2), Constraint::Length(input_height)])
             .split(area);
         let history = self.chat_history_lines(inner[0], mode);
+        let history_len = history.len();
         let viewport = inner[0].height.saturating_sub(2) as usize;
         let max_scroll = history.len().saturating_sub(viewport);
         self.chat_scroll = self
@@ -2573,11 +2698,21 @@ impl App {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(format!("Chat: {}", self.session_title)),
+                    .border_style(panel_border_style())
+                    .title(format!("Chat: {}", self.session_title))
+                    .title_style(panel_title_style()),
             )
             .scroll((self.chat_scroll, 0))
             .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, inner[0]);
+        render_vertical_scrollbar(
+            frame,
+            inner[0],
+            self.chat_scroll as usize,
+            history_len,
+            viewport,
+            true,
+        );
 
         let editor_lines = editor_render_lines(
             &self.chat_input,
@@ -2593,12 +2728,28 @@ impl App {
         } else {
             "Input".to_string()
         };
+        let editor_line_count = editor_lines.len();
+        let editor_viewport = inner[1].height.saturating_sub(2) as usize;
         frame.render_widget(
             Paragraph::new(editor_lines)
-                .block(Block::default().borders(Borders::ALL).title(editor_title))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(panel_border_style())
+                        .title(editor_title)
+                        .title_style(panel_title_style()),
+                )
                 .scroll((editor_scroll, 0))
                 .wrap(Wrap { trim: false }),
             inner[1],
+        );
+        render_vertical_scrollbar(
+            frame,
+            inner[1],
+            editor_scroll as usize,
+            editor_line_count,
+            editor_viewport,
+            true,
         );
         self.last_layout.input = inner[1];
         self.last_layout.list = inner[0];
@@ -2612,7 +2763,7 @@ impl App {
                 frame.render_widget(Clear, popup);
                 frame.render_widget(
                     Paragraph::new(suggestions.into_iter().map(Line::from).collect::<Vec<_>>())
-                        .block(Block::default().borders(Borders::ALL).title("Commands")),
+                        .block(panel_block("Commands")),
                     popup,
                 );
             }
@@ -2622,7 +2773,10 @@ impl App {
     fn chat_history_lines(&self, area: Rect, _mode: LayoutMode) -> Vec<Line<'static>> {
         let width = inner_width(area).max(1);
         if self.chat.is_empty() {
-            return vec![Line::from("No conversation yet. Press c to start.")];
+            return vec![Line::from(Span::styled(
+                "No conversation yet. Press c to start.",
+                muted_style(),
+            ))];
         }
         let mut lines = Vec::new();
         for exchange in &self.chat {
@@ -2677,23 +2831,35 @@ impl App {
             .map(|model| {
                 let marker = if model.active { "◆" } else { "◇" };
                 let style = model_state_style(model.active, model.available);
-                let mut lines = vec![Line::from(vec![
+                let name_width = sections[0].width.saturating_sub(18) as usize;
+                let mut first_line = vec![
                     Span::styled(format!("{marker} "), style),
                     Span::styled(
-                        compact(
-                            &model.display_name,
-                            sections[0].width.saturating_sub(16) as usize,
-                        ),
+                        compact(&model.display_name, name_width.max(8)),
                         style.add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(format!(" [{}]", model.location), style),
-                ])];
+                ];
                 if mode != LayoutMode::Mini {
-                    lines.push(Line::from(format!(
-                        "   {}  caps: {}",
-                        model.id,
-                        model.capabilities.join(", ")
-                    )));
+                    first_line.push(Span::styled(
+                        format!(" [{}]", compact(&model.location, 12)),
+                        style,
+                    ));
+                }
+                let mut lines = vec![Line::from(first_line)];
+                if mode == LayoutMode::Full {
+                    lines.push(Line::from(vec![
+                        Span::styled("   ", muted_style()),
+                        Span::styled(compact(&model.id, 28), muted_style()),
+                        Span::styled(
+                            format!("  caps: {}", compact(&model.capabilities.join(", "), 42)),
+                            muted_style(),
+                        ),
+                    ]));
+                } else if mode == LayoutMode::Compact {
+                    lines.push(Line::from(vec![
+                        Span::styled("   ", muted_style()),
+                        Span::styled(compact(&model.id, 20), muted_style()),
+                    ]));
                 }
                 ListItem::new(lines)
             })
@@ -2709,64 +2875,89 @@ impl App {
                         .borders(Borders::ALL)
                         .title("Available models"),
                 )
-                .highlight_style(Style::default().add_modifier(Modifier::BOLD)),
+                .highlight_style(selected_row_style()),
             sections[0],
             &mut list_state,
         );
+        self.list_scroll = list_state.offset();
+        let model_item_height = if mode == LayoutMode::Mini { 1 } else { 2 };
+        render_vertical_scrollbar(
+            frame,
+            sections[0],
+            list_state.offset(),
+            available.len(),
+            sections[0].height.saturating_sub(2) as usize / model_item_height,
+            true,
+        );
         let active_model = available.iter().find(|model| model.active);
-        let diagnostics = vec![
-            Line::from(Span::styled(
-                "Runtime diagnostics",
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(format!(
-                "Active: {}",
-                active_model
-                    .map(|model| model.display_name.as_str())
-                    .unwrap_or("none")
-            )),
-            Line::from(format!(
-                "Ready: {}",
-                self.model_status
-                    .as_ref()
-                    .map(|status| status.ready)
-                    .unwrap_or(false)
-            )),
-            Line::from(format!(
-                "Endpoint: {}",
-                active_model
-                    .map(|model| model.endpoint.as_str())
-                    .unwrap_or("n/a")
-            )),
-            Line::from(format!(
-                "Context: {}   VRAM: {}",
-                active_model
-                    .map(|model| model.context.as_str())
-                    .unwrap_or("n/a"),
-                active_model
-                    .map(|model| model.vram.as_str())
-                    .unwrap_or("n/a")
-            )),
-            Line::from(format!(
-                "PID: {}   Generation: {}",
-                active_model
-                    .map(|model| model.pid.as_str())
-                    .unwrap_or("n/a"),
-                active_model
-                    .map(|model| model.speed.as_str())
-                    .unwrap_or("n/a")
-            )),
-        ];
+        let diagnostics = if mode == LayoutMode::Mini {
+            vec![
+                Line::from(Span::styled("Runtime", section_style())),
+                Line::from(format!(
+                    "Active: {}",
+                    active_model
+                        .map(|model| compact(&model.display_name, 28))
+                        .unwrap_or_else(|| "none".to_string())
+                )),
+                Line::from(format!(
+                    "Ready: {}",
+                    self.model_status
+                        .as_ref()
+                        .map(|status| status.ready)
+                        .unwrap_or(false)
+                )),
+            ]
+        } else {
+            vec![
+                Line::from(Span::styled("Runtime diagnostics", section_style())),
+                Line::from(format!(
+                    "Active: {}",
+                    active_model
+                        .map(|model| model.display_name.as_str())
+                        .unwrap_or("none")
+                )),
+                Line::from(format!(
+                    "Ready: {}",
+                    self.model_status
+                        .as_ref()
+                        .map(|status| status.ready)
+                        .unwrap_or(false)
+                )),
+                Line::from(format!(
+                    "Endpoint: {}",
+                    active_model
+                        .map(|model| model.endpoint.as_str())
+                        .unwrap_or("n/a")
+                )),
+                Line::from(format!(
+                    "Context: {}   VRAM: {}",
+                    active_model
+                        .map(|model| model.context.as_str())
+                        .unwrap_or("n/a"),
+                    active_model
+                        .map(|model| model.vram.as_str())
+                        .unwrap_or("n/a")
+                )),
+                Line::from(format!(
+                    "PID: {}   Generation: {}",
+                    active_model
+                        .map(|model| model.pid.as_str())
+                        .unwrap_or("n/a"),
+                    active_model
+                        .map(|model| model.speed.as_str())
+                        .unwrap_or("n/a")
+                )),
+            ]
+        };
         frame.render_widget(
-            Paragraph::new(diagnostics)
-                .block(Block::default().borders(Borders::ALL).title("Diagnostics")),
+            Paragraph::new(diagnostics).block(panel_block("Diagnostics")),
             sections[1],
         );
         self.last_layout.list = sections[0];
     }
 
-    fn draw_jobs(&mut self, frame: &mut Frame, area: Rect, _mode: LayoutMode) {
-        let block = Block::default().borders(Borders::ALL).title("Jobs");
+    fn draw_jobs(&mut self, frame: &mut Frame, area: Rect, mode: LayoutMode) {
+        let block = panel_block("Jobs");
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let mut items = Vec::new();
@@ -2776,7 +2967,7 @@ impl App {
             if last_status != Some(job.status.as_str()) {
                 items.push(ListItem::new(Line::from(Span::styled(
                     format!("▸ {}", job_status_group_label(&job.status)),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    section_style(),
                 ))));
                 last_status = Some(job.status.as_str());
             }
@@ -2792,27 +2983,59 @@ impl App {
             } else {
                 "•"
             };
+            let line = match mode {
+                LayoutMode::Mini => format!(
+                    "{marker} {}  {}",
+                    compact(&job.job_type, 22),
+                    compact(&job.status, 10)
+                ),
+                LayoutMode::Compact => format!(
+                    "{marker} {:<18} {:<10} {}",
+                    compact(&job.job_type, 18),
+                    compact(&job.status, 10),
+                    compact(&job.next_run_at, 18)
+                ),
+                LayoutMode::Full | LayoutMode::TooSmall => format!(
+                    "{marker} {:<22} {:<10} {}",
+                    compact(&job.job_type, 22),
+                    compact(&job.status, 10),
+                    compact(&job.next_run_at, 30)
+                ),
+            };
             items.push(ListItem::new(Line::from(vec![
                 Span::styled(format!("{marker} "), job_status_style(&job.status)),
-                Span::raw(format!(
-                    "{:<22} {:<10} {}",
-                    compact(&job.job_type, 22),
-                    job.status,
-                    compact(&job.next_run_at, 30)
-                )),
+                Span::raw(line.trim_start_matches(&format!("{marker} ")).to_string()),
             ])));
         }
         if items.is_empty() {
-            items.push(ListItem::new(Line::from("No jobs yet.")));
+            items.push(ListItem::new(Line::from(Span::styled(
+                "No jobs yet.",
+                muted_style(),
+            ))));
         }
         let mut state = ListState::default();
         state.select(selected_item);
         frame.render_stateful_widget(
-            List::new(items).highlight_style(Style::default().add_modifier(Modifier::BOLD)),
+            List::new(items).highlight_style(selected_row_style()),
             inner,
             &mut state,
         );
-        self.last_layout.list = area;
+        self.list_scroll = state.offset();
+        render_vertical_scrollbar(
+            frame,
+            inner,
+            state.offset(),
+            grouped_visual_item_count(
+                &self
+                    .jobs
+                    .iter()
+                    .map(|job| job.status.as_str())
+                    .collect::<Vec<_>>(),
+            ),
+            inner.height as usize,
+            false,
+        );
+        self.last_layout.list = inner;
     }
 
     fn draw_search(&mut self, frame: &mut Frame, area: Rect, _mode: LayoutMode) {
@@ -2838,17 +3061,22 @@ impl App {
             Paragraph::new(input_text).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Search / everything"),
+                    .border_style(panel_border_style())
+                    .title("Search / everything")
+                    .title_style(panel_title_style()),
             ),
             vertical[0],
         );
         self.last_layout.input = vertical[0];
         let lines = if self.search_results.is_empty() {
-            vec![Line::from(if self.search_input.is_empty() {
-                "Press / to search indexed memory."
-            } else {
-                "No results."
-            })]
+            vec![Line::from(Span::styled(
+                if self.search_input.is_empty() {
+                    "Press / to search indexed memory."
+                } else {
+                    "No results."
+                },
+                muted_style(),
+            ))]
         } else {
             self.search_results
                 .iter()
@@ -2858,10 +3086,7 @@ impl App {
                         .map(|(source, _)| source)
                         .unwrap_or("RESULT");
                     Line::from(vec![
-                        Span::styled(
-                            format!("{source:<9} "),
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ),
+                        Span::styled(format!("{source:<9} "), section_style()),
                         Span::raw(format!(
                             "{:.2}  {}",
                             score,
@@ -2876,24 +3101,35 @@ impl App {
     }
 
     fn render_selectable_lines(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         lines: Vec<Line<'static>>,
         title: &str,
     ) {
         let items = lines.into_iter().map(ListItem::new).collect::<Vec<_>>();
+        let item_count = items.len();
         let mut state = ListState::default();
         if !items.is_empty() {
             state.select(Some(self.selected.min(items.len().saturating_sub(1))));
         }
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+            .block(panel_block(title))
+            .highlight_style(selected_row_style());
         frame.render_stateful_widget(list, area, &mut state);
+        self.list_scroll = state.offset();
+        render_vertical_scrollbar(
+            frame,
+            area,
+            state.offset(),
+            item_count,
+            area.height.saturating_sub(2) as usize,
+            true,
+        );
     }
 
-    fn draw_modal(&self, frame: &mut Frame, mode: LayoutMode) {
+    fn draw_modal(&mut self, frame: &mut Frame, mode: LayoutMode) {
+        self.last_layout.modal = Rect::default();
         let area = frame.area();
         if let Some(form) = &self.form {
             let width = match mode {
@@ -2913,7 +3149,9 @@ impl App {
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(form_title(form)),
+                            .border_style(panel_border_style())
+                            .title(form_title(form))
+                            .title_style(panel_title_style()),
                     )
                     .wrap(Wrap { trim: false }),
                 popup,
@@ -2934,18 +3172,90 @@ impl App {
         let x = area.x + area.width.saturating_sub(width) / 2;
         let y = area.y + area.height.saturating_sub(height) / 2;
         let popup = Rect::new(x, y, width.max(20), height.max(5));
+        let viewport = popup.height.saturating_sub(2) as usize;
+        let max_scroll = lines.len().saturating_sub(viewport);
+        self.modal_scroll = self
+            .modal_scroll
+            .min(max_scroll.min(u16::MAX as usize) as u16);
         frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new(lines)
+            Paragraph::new(lines.clone())
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(modal_title(modal)),
+                        .border_style(panel_border_style())
+                        .title(modal_title(modal))
+                        .title_style(panel_title_style()),
                 )
+                .scroll((self.modal_scroll, 0))
                 .wrap(Wrap { trim: false }),
             popup,
         );
+        render_vertical_scrollbar(
+            frame,
+            popup,
+            self.modal_scroll as usize,
+            lines.len(),
+            viewport,
+            true,
+        );
+        self.last_layout.modal = popup;
     }
+}
+
+fn render_vertical_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    position: usize,
+    content_length: usize,
+    viewport_length: usize,
+    inset: bool,
+) {
+    if area.height == 0
+        || area.width == 0
+        || content_length <= viewport_length
+        || viewport_length == 0
+    {
+        return;
+    }
+    let scrollbar_area = if inset {
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        })
+    } else {
+        area
+    };
+    if scrollbar_area.height == 0 || scrollbar_area.width == 0 {
+        return;
+    }
+    let mut state = ScrollbarState::new(content_length)
+        .position(position.min(content_length.saturating_sub(viewport_length)))
+        .viewport_content_length(viewport_length);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(Some("│"))
+        .thumb_symbol("█")
+        .track_style(muted_style())
+        .thumb_style(Style::default().fg(Color::Cyan));
+    frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
+}
+
+fn grouped_visual_item_count(statuses: &[&str]) -> usize {
+    if statuses.is_empty() {
+        return 1;
+    }
+    let mut count = 0usize;
+    let mut previous: Option<&str> = None;
+    for status in statuses {
+        if previous != Some(*status) {
+            count += 1;
+            previous = Some(*status);
+        }
+        count += 1;
+    }
+    count
 }
 
 fn indexed_grouped_row(statuses: &[&str], row: usize) -> Option<usize> {
@@ -3033,7 +3343,7 @@ fn form_lines(form: &FormState, width: usize) -> Vec<Line<'static>> {
         let value = form.values.get(index).map(String::as_str).unwrap_or("");
         let marker = if active { ">" } else { " " };
         let style = if active {
-            Style::default().add_modifier(Modifier::BOLD)
+            selected_row_style()
         } else {
             Style::default()
         };
@@ -3085,7 +3395,10 @@ fn form_lines(form: &FormState, width: usize) -> Vec<Line<'static>> {
         )));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from("Tab/Shift+Tab fields   Enter save   Esc cancel"));
+    lines.push(Line::from(Span::styled(
+        "Tab/Shift+Tab fields   Enter save   Esc cancel",
+        muted_style(),
+    )));
     lines
 }
 
@@ -3345,8 +3658,46 @@ fn detail_lines(lines: Vec<String>, width: usize, footer: &str) -> Vec<Line<'sta
         ));
     }
     output.push(Line::from(""));
-    output.push(Line::from(footer.to_string()));
+    output.push(Line::from(Span::styled(footer.to_string(), muted_style())));
     output
+}
+
+fn panel_border_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn panel_title_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn section_style() -> Style {
+    Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn muted_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn selected_row_style() -> Style {
+    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+}
+
+fn active_tab_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+}
+
+fn panel_block(title: &str) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(panel_border_style())
+        .title(title)
+        .title_style(panel_title_style())
 }
 
 fn footer_commands(
@@ -3407,10 +3758,11 @@ fn tab_lines(selected: usize, width: u16) -> Vec<Line<'static>> {
             current.push(Span::raw("  "));
             current_width += 2;
         }
-        let mut style = Style::default();
-        if index == selected {
-            style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-        }
+        let style = if index == selected {
+            active_tab_style()
+        } else {
+            Style::default()
+        };
         current_width += label.len();
         current.push(Span::styled(label, style));
     }
@@ -3448,18 +3800,28 @@ fn tab_from_mouse(x: u16, y: u16, header: Rect) -> Option<Tab> {
 }
 
 fn task_header_line(width: usize, mode: LayoutMode) -> Line<'static> {
-    let due_width = if mode == LayoutMode::Mini { 11 } else { 16 };
-    let status_width = if mode == LayoutMode::Mini { 8 } else { 12 };
-    let priority_width = if mode == LayoutMode::Mini { 5 } else { 8 };
+    if mode == LayoutMode::Mini {
+        let due_width = 11;
+        let title_width = width.saturating_sub(due_width + 4).max(8);
+        return Line::from(Span::styled(
+            format!(
+                "{:<due_width$}  {:<title_width$}  □",
+                "Due",
+                "Task",
+                due_width = due_width,
+                title_width = title_width.min(28),
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let due_width = 16;
+    let status_width = 12;
+    let priority_width = 8;
     let title_width = width
         .saturating_sub(due_width + status_width + priority_width + 8)
         .max(10)
-        .min(match mode {
-            LayoutMode::Full => 54,
-            LayoutMode::Compact => 38,
-            LayoutMode::Mini => 22,
-            LayoutMode::TooSmall => 14,
-        });
+        .min(if mode == LayoutMode::Full { 54 } else { 38 });
     Line::from(Span::styled(
         format!(
             "{:<due_width$}  {:<title_width$}  {:<status_width$} {:<priority_width$}  □",
@@ -3477,23 +3839,32 @@ fn task_header_line(width: usize, mode: LayoutMode) -> Line<'static> {
 }
 
 fn task_line(task: &UiTask, width: usize, mode: LayoutMode) -> Line<'static> {
-    let due_width = if mode == LayoutMode::Mini { 11 } else { 16 };
-    let status_width = if mode == LayoutMode::Mini { 8 } else { 12 };
-    let priority_width = if mode == LayoutMode::Mini { 5 } else { 8 };
+    let checkbox = task_symbol(&task.status);
+    if mode == LayoutMode::Mini {
+        let due_width = 11;
+        let title_width = width.saturating_sub(due_width + 5).max(8).min(28);
+        let due = compact(task.due_at.as_deref().unwrap_or("--"), due_width);
+        let title = compact(&task.title, title_width);
+        return Line::from(format!(
+            "{:<due_width$}  {:<title_width$}  {checkbox}",
+            due,
+            title,
+            due_width = due_width,
+            title_width = title_width,
+        ));
+    }
+
+    let due_width = 16;
+    let status_width = 12;
+    let priority_width = 8;
     let title_width = width
         .saturating_sub(due_width + status_width + priority_width + 8)
         .max(10)
-        .min(match mode {
-            LayoutMode::Full => 54,
-            LayoutMode::Compact => 38,
-            LayoutMode::Mini => 22,
-            LayoutMode::TooSmall => 14,
-        });
+        .min(if mode == LayoutMode::Full { 54 } else { 38 });
     let due = compact(task.due_at.as_deref().unwrap_or("--"), due_width);
     let title = compact(&task.title, title_width);
     let status = compact(&task_status_label(&task.status), status_width);
     let priority = compact(&task_priority_label(&task.priority), priority_width);
-    let checkbox = task_symbol(&task.status);
     Line::from(format!(
         "{:<due_width$}  {:<title_width$}  {:<status_width$} {:<priority_width$}  {checkbox}",
         due,
@@ -3690,13 +4061,21 @@ fn proposal_decision_label(decision: &str) -> String {
 }
 
 fn proposal_header_line(width: usize, mode: LayoutMode) -> Line<'static> {
-    let title_width = match mode {
-        LayoutMode::Full => 42,
-        LayoutMode::Compact => 30,
-        LayoutMode::Mini | LayoutMode::TooSmall => 20,
+    if mode == LayoutMode::Mini {
+        let title_width = width.saturating_sub(18).max(8).min(28);
+        return Line::from(Span::styled(
+            format!(
+                "{:<title_width$}  Decision",
+                "Title",
+                title_width = title_width,
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
     }
-    .min(width.saturating_sub(24).max(8));
-    let date_width = if mode == LayoutMode::Mini { 8 } else { 17 };
+
+    let title_width =
+        if mode == LayoutMode::Full { 42 } else { 30 }.min(width.saturating_sub(24).max(8));
+    let date_width = 17;
     Line::from(Span::styled(
         format!(
             "{:<title_width$}  {:<date_width$}  Recommended Decision",
@@ -3710,14 +4089,20 @@ fn proposal_header_line(width: usize, mode: LayoutMode) -> Line<'static> {
 }
 
 fn proposal_list_line(proposal: &UiProposal, width: usize, mode: LayoutMode) -> Line<'static> {
-    let title_width = match mode {
-        LayoutMode::Full => 42,
-        LayoutMode::Compact => 30,
-        LayoutMode::Mini | LayoutMode::TooSmall => 20,
-    }
-    .min(width.saturating_sub(24).max(8));
-    let date_width = if mode == LayoutMode::Mini { 8 } else { 17 };
     let decision = proposal_decision_label(&proposal.decision);
+    if mode == LayoutMode::Mini {
+        let title_width = width.saturating_sub(16).max(8).min(28);
+        return Line::from(format!(
+            "{:<title_width$}  {}",
+            compact(&proposal_title(proposal), title_width),
+            compact(&decision, width.saturating_sub(title_width + 2).max(8)),
+            title_width = title_width,
+        ));
+    }
+
+    let title_width =
+        if mode == LayoutMode::Full { 42 } else { 30 }.min(width.saturating_sub(24).max(8));
+    let date_width = 17;
     let title = compact(&proposal_title(proposal), title_width);
     let date = compact(&proposal_created_at(proposal), date_width);
     Line::from(format!(
@@ -4516,6 +4901,59 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mini_task_line_stays_compact() {
+        let task = UiTask {
+            id: "1".to_string(),
+            title: "A very long task title that should be compacted".to_string(),
+            body: String::new(),
+            status: "open".to_string(),
+            priority: "high".to_string(),
+            due_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            project: None,
+        };
+        let line = task_line(&task, 38, LayoutMode::Mini);
+        assert!(line.width() <= 38);
+    }
+
+    #[test]
+    fn mini_proposal_line_stays_compact() {
+        let proposal = UiProposal {
+            id: "1".to_string(),
+            title: "A very long proposal title that should be compacted".to_string(),
+            proposed_memory: "memory".to_string(),
+            conversation_turn_id: String::new(),
+            decision: "should_save".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            status: String::new(),
+            item_kind: String::new(),
+            tags: Vec::new(),
+            item_count: 1,
+        };
+        let line = proposal_list_line(&proposal, 38, LayoutMode::Mini);
+        assert!(line.width() <= 38);
+    }
+
+    #[test]
+    fn mini_job_line_stays_compact() {
+        let line = format!(
+            "{} {}  {}",
+            "⟳",
+            compact("a_very_long_job_type", 22),
+            compact("running", 10)
+        );
+        assert!(line.chars().count() <= 38);
+    }
+
+    #[test]
+    fn grouped_visual_item_count_includes_status_headers() {
+        assert_eq!(grouped_visual_item_count(&[]), 1);
+        assert_eq!(grouped_visual_item_count(&["open", "open", "completed"]), 5);
+    }
 
     #[test]
     fn layout_thresholds_match_design() {
