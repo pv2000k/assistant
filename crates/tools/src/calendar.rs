@@ -920,28 +920,6 @@ impl GoogleCalendarClient {
             }),
         })
     }
-
-    pub fn delete_event(&self, arguments: &Value) -> Result<ToolResultData> {
-        let (calendar_id, event_id, send_updates) = build_delete_event(arguments)?;
-        let calendar_id = if calendar_id.is_empty() {
-            self.default_calendar_id.to_string()
-        } else {
-            calendar_id
-        };
-        let mut url = self.events_url(&calendar_id, Some(&event_id))?;
-        url.query_pairs_mut()
-            .append_pair("sendUpdates", &send_updates);
-
-        self.send_mutation(Method::DELETE, url, None)?;
-
-        Ok(ToolResultData {
-            output: serde_json::json!({
-                "calendar_id": calendar_id,
-                "event_id": event_id,
-                "deleted": true
-            }),
-        })
-    }
 }
 
 fn scope_grants_event_write(scope: &str) -> bool {
@@ -1191,30 +1169,6 @@ fn build_update_event(arguments: &Value) -> Result<(String, String, Value, Strin
     let send_updates = validate_send_updates(object.get("send_updates"))?;
 
     Ok((calendar_id, event_id.to_string(), patch, send_updates))
-}
-
-fn build_delete_event(arguments: &Value) -> Result<(String, String, String)> {
-    let object = arguments
-        .as_object()
-        .ok_or("calendar.delete_event arguments must be an object.")?;
-
-    for key in object.keys() {
-        if !matches!(key.as_str(), "calendar_id" | "event_id" | "send_updates") {
-            return Err(format!("calendar.delete_event does not accept argument '{key}'.").into());
-        }
-    }
-
-    let calendar_id = optional_calendar_id(object, "calendar.delete_event")?;
-    let event_id = object
-        .get("event_id")
-        .and_then(Value::as_str)
-        .ok_or("calendar.delete_event requires event_id.")?;
-    if event_id.trim().is_empty() {
-        return Err("calendar.delete_event event_id cannot be empty.".into());
-    }
-
-    let send_updates = validate_send_updates(object.get("send_updates"))?;
-    Ok((calendar_id, event_id.to_string(), send_updates))
 }
 
 fn optional_nonempty_string(value: Option<&Value>, name: &str) -> Result<Option<String>> {
@@ -1495,65 +1449,6 @@ impl crate::Tool for GoogleCalendarUpdateEventTool {
     }
 }
 
-pub struct GoogleCalendarDeleteEventTool {
-    client: GoogleCalendarClient,
-}
-
-impl GoogleCalendarDeleteEventTool {
-    pub fn new(client: GoogleCalendarClient) -> Self {
-        Self { client }
-    }
-
-    pub fn with_credentials(
-        access_token: impl Into<String>,
-        default_calendar_id: impl Into<String>,
-    ) -> Result<Self> {
-        Ok(Self::new(GoogleCalendarClient::new(
-            access_token,
-            default_calendar_id,
-        )?))
-    }
-
-    pub fn with_auth(
-        auth: GoogleCalendarAuth,
-        default_calendar_id: impl Into<String>,
-    ) -> Result<Self> {
-        Ok(Self::new(GoogleCalendarClient::with_auth(
-            auth,
-            default_calendar_id,
-        )?))
-    }
-
-    pub fn with_base_url(
-        access_token: impl Into<String>,
-        default_calendar_id: impl Into<String>,
-        base_url: &str,
-    ) -> Result<Self> {
-        Ok(Self::new(GoogleCalendarClient::with_base_url(
-            access_token,
-            default_calendar_id,
-            base_url,
-        )?))
-    }
-}
-
-impl crate::Tool for GoogleCalendarDeleteEventTool {
-    fn definition(&self) -> crate::ToolDefinition {
-        crate::ToolDefinition {
-            name: "calendar.delete_event".to_string(),
-            description: "Delete a Google Calendar event. Requires explicit approval.".to_string(),
-            permission: crate::ToolPermission::Destructive,
-        }
-    }
-
-    fn execute(&self, arguments: &Value) -> Result<crate::ToolResult> {
-        Ok(crate::ToolResult {
-            success: true,
-            output: self.client.delete_event(arguments)?.output,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1761,7 +1656,6 @@ mod tests {
     fn mutation_tools_have_expected_permissions() -> Result<()> {
         let create = GoogleCalendarCreateEventTool::with_credentials("test-token", "primary")?;
         let update = GoogleCalendarUpdateEventTool::with_credentials("test-token", "primary")?;
-        let delete = GoogleCalendarDeleteEventTool::with_credentials("test-token", "primary")?;
 
         assert_eq!(
             create.definition().permission,
@@ -1771,11 +1665,6 @@ mod tests {
             update.definition().permission,
             crate::ToolPermission::ApprovalRequired
         );
-        assert_eq!(
-            delete.definition().permission,
-            crate::ToolPermission::Destructive
-        );
-
         Ok(())
     }
 
@@ -1824,29 +1713,6 @@ mod tests {
 
         assert!(result.success);
         assert_eq!(result.output["event"]["summary"], "Renamed");
-        handle.join().map_err(|_| "mock server thread panicked")?;
-        Ok(())
-    }
-
-    #[test]
-    fn delete_event_uses_delete_and_accepts_empty_response() -> Result<()> {
-        let (base_url, handle) = start_request_mock_server(
-            "DELETE",
-            "/calendar/v3/calendars/primary/events/evt-1?sendUpdates=none",
-            None,
-            "204 No Content",
-            "",
-        )?;
-
-        let tool =
-            GoogleCalendarDeleteEventTool::with_base_url("test-token", "primary", &base_url)?;
-
-        let result = tool.execute(&serde_json::json!({
-            "event_id": "evt-1"
-        }))?;
-
-        assert!(result.success);
-        assert_eq!(result.output["deleted"], true);
         handle.join().map_err(|_| "mock server thread panicked")?;
         Ok(())
     }

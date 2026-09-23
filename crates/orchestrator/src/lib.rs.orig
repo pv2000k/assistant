@@ -295,7 +295,7 @@ pub trait ModelExecutor {
     }
 }
 
-pub trait ApprovalHandler {
+pub trait ApprovalHandler: Send + Sync {
     fn approve(&self, call: &ToolCall) -> Result<bool, Box<dyn std::error::Error>>;
 }
 
@@ -812,11 +812,11 @@ where
                             matches!(
                                 tool.as_str(),
                                 "files.read"
+                                    | "system.info"
                                     | "memory.write"
                                     | "calendar.get_event"
                                     | "calendar.create_event"
                                     | "calendar.update_event"
-                                    | "calendar.delete_event"
                             )
                         }
 
@@ -1288,6 +1288,17 @@ impl LlamaCppController {
             .to_string()
     }
 
+    fn unquote_task_reminder_text(text: &str) -> String {
+        let trimmed = text.trim();
+        if let Some(inner) = trimmed
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+        {
+            return inner.trim().to_string();
+        }
+        trimmed.to_string()
+    }
+
     fn strip_prefix_case_insensitive<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
         let value = value.trim();
         let lower = value.to_ascii_lowercase();
@@ -1319,6 +1330,23 @@ impl LlamaCppController {
         }
 
         (cleaned, None)
+    }
+
+    fn split_leading_due_clause(value: &str) -> Option<(String, String)> {
+        let cleaned = Self::clean_task_reminder_text(value);
+        let words = cleaned.split_whitespace().collect::<Vec<_>>();
+
+        for end in (1..words.len()).rev() {
+            let due = words[..end].join(" ");
+            if tools::tasks::is_due_expression(&due) {
+                let body = words[end..].join(" ");
+                if !body.is_empty() {
+                    return Some((due, body));
+                }
+            }
+        }
+
+        None
     }
 
     fn parse_conversational_create(
@@ -1405,7 +1433,31 @@ impl LlamaCppController {
             }
             let (title, due) = Self::split_due_clause(remainder);
             if !title.trim().is_empty() {
-                return Some(("tasks.mutate", title.trim().to_string(), due));
+                return Some((
+                    "tasks.mutate",
+                    Self::unquote_task_reminder_text(&title),
+                    due,
+                ));
+            }
+        }
+
+        if let Some(remainder) = Self::strip_prefix_case_insensitive(&cleaned, "remind me ") {
+            if let Some(after_to) = Self::strip_prefix_case_insensitive(remainder, "to ") {
+                let (body, due) = Self::split_due_clause(after_to);
+                if !body.trim().is_empty() {
+                    return Some((
+                        "reminders.mutate",
+                        Self::unquote_task_reminder_text(&body),
+                        due,
+                    ));
+                }
+            } else if let Some((due, body)) = Self::split_leading_due_clause(remainder) {
+                let body = Self::strip_prefix_case_insensitive(&body, "to ").unwrap_or(&body);
+                return Some((
+                    "reminders.mutate",
+                    Self::unquote_task_reminder_text(&body),
+                    Some(due),
+                ));
             }
         }
 
@@ -1415,7 +1467,11 @@ impl LlamaCppController {
         {
             let (body, due) = Self::split_due_clause(remainder);
             if !body.trim().is_empty() {
-                return Some(("reminders.mutate", body.trim().to_string(), due));
+                return Some((
+                    "reminders.mutate",
+                    Self::unquote_task_reminder_text(&body),
+                    due,
+                ));
             }
         }
 
@@ -1448,6 +1504,19 @@ impl LlamaCppController {
         } else {
             None
         }
+    }
+
+    fn reject_model_selected_cloud_consultation(
+        plan: QueryPlan,
+    ) -> Result<QueryPlan, Box<dyn std::error::Error>> {
+        if matches!(plan.intent, QueryIntent::ConsultModel { .. }) {
+            return Err(
+                "Cloud model consultation requires an explicit user request naming the target model."
+                    .into(),
+            );
+        }
+
+        Ok(plan)
     }
 
     fn parse_task_reminder_list(text: &str) -> Option<(&'static str, serde_json::Value)> {
@@ -1599,16 +1668,198 @@ impl LlamaCppController {
         Some((tool, operation, query, due))
     }
 
+    fn parse_system_info_request(text: &str) -> Option<&'static str> {
+        let lower = Self::clean_task_reminder_text(text).to_ascii_lowercase();
+
+        if lower.is_empty() {
+            return None;
+        }
+
+        if lower.contains("system info")
+            || lower.contains("system information")
+            || lower.contains("machine specs")
+            || lower.contains("computer specs")
+            || lower.contains("system specs")
+            || lower.contains("hardware specs")
+        {
+            return Some("all");
+        }
+
+        if lower.contains("remember")
+            || lower.contains("recall")
+            || lower.contains("what do you know about")
+            || lower.contains("what have you stored")
+        {
+            return None;
+        }
+
+        if lower.contains("network status")
+            || lower.contains("network information")
+            || lower.contains("wifi status")
+            || lower.contains("wi-fi status")
+        {
+            return Some("network");
+        }
+
+        if lower.contains("runtime status")
+            || lower.contains("assistant status")
+            || lower.contains("zaraki status")
+            || lower.contains("service status")
+            || lower.contains("is zaraki ready")
+            || lower.contains("is the runtime ready")
+            || lower.contains("which model am i talking to")
+            || lower.contains("what model am i talking to")
+            || lower.contains("what model are you using")
+            || lower.contains("which model are you using")
+            || lower.contains("what model is active")
+            || lower.contains("what model is running")
+            || lower.contains("what is the current model")
+            || lower.contains("what's the current model")
+            || lower == "current model"
+        {
+            return Some("runtime");
+        }
+
+        if lower.contains("what gpu")
+            || lower.contains("which gpu")
+            || lower.contains("gpu do i have")
+            || lower.contains("vram")
+            || lower.contains("graphics card")
+            || lower.contains("what cpu")
+            || lower.contains("which cpu")
+            || lower.contains("cpu do i have")
+            || lower.contains("what processor")
+            || lower.contains("which processor")
+            || lower.contains("processor do i have")
+            || lower.contains("how many cores")
+            || lower.contains("how much ram")
+            || lower.contains("ram do i have")
+            || lower.contains("how much memory do i have")
+            || lower.contains("memory usage")
+            || lower.contains("system memory")
+            || lower.contains("available memory")
+            || lower.contains("disk space")
+            || lower.contains("storage space")
+            || lower.contains("how much storage")
+            || lower.contains("battery status")
+            || lower.contains("how much battery")
+            || lower.contains("machine hardware")
+            || lower.contains("operating system")
+            || lower.contains("what os")
+        {
+            return Some("hardware");
+        }
+
+        None
+    }
+
+    fn calendar_sync_request(text: &str) -> bool {
+        let lower = Self::clean_task_reminder_text(text).to_ascii_lowercase();
+        lower.contains("google calendar")
+            && (lower.contains("sync")
+                || lower.contains("mirror")
+                || lower.contains("add it to")
+                || lower.contains("add to"))
+    }
+
+    fn strip_calendar_sync_suffix(text: &str) -> (String, bool) {
+        let cleaned = Self::clean_task_reminder_text(text);
+        let lower = cleaned.to_ascii_lowercase();
+        let markers = [
+            " and sync it to google calendar too",
+            " and sync to google calendar too",
+            " sync it to google calendar too",
+            " sync to google calendar too",
+            " and mirror it to google calendar",
+            " and mirror to google calendar",
+            " and sync it to google calendar",
+            " and sync to google calendar",
+            " sync it to google calendar",
+            " sync to google calendar",
+            " and add it to google calendar",
+            " and add to google calendar",
+        ];
+
+        for marker in markers {
+            if lower.ends_with(marker) {
+                let end = cleaned.len() - marker.len();
+                let base = cleaned[..end].trim_end().to_string();
+                if !base.is_empty() {
+                    return (base, true);
+                }
+            }
+        }
+
+        (cleaned, false)
+    }
+
+    fn recent_created_reminder_title(history: &str) -> Option<String> {
+        let marker = "reminder created: '";
+        let lower = history.to_ascii_lowercase();
+        let start = lower.rfind(marker)? + marker.len();
+        let end = history[start..].find('\'')? + start;
+        let title = history[start..end].trim();
+        (!title.is_empty()).then(|| title.to_string())
+    }
+
+    fn calendar_sync_target_query(text: &str, history: &str) -> Option<String> {
+        if !Self::calendar_sync_request(text) {
+            return None;
+        }
+
+        let cleaned = Self::clean_task_reminder_text(text);
+        let lower = cleaned.to_ascii_lowercase();
+        let pronoun_request = [
+            "sync it",
+            "sync that",
+            "sync this",
+            "mirror it",
+            "mirror that",
+            "mirror this",
+            "add it to",
+            "add that to",
+            "add this to",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
+
+        if pronoun_request {
+            return Self::recent_created_reminder_title(history);
+        }
+
+        let suffix_index = lower
+            .rfind(" to google calendar too")
+            .or_else(|| lower.rfind(" to google calendar"));
+        if let Some(suffix_index) = suffix_index {
+            let sync_index = lower[..suffix_index].rfind("sync")?;
+            let mut query = cleaned[sync_index + "sync".len()..suffix_index].trim();
+            for prefix in ["the reminder ", "reminder "] {
+                if query.to_ascii_lowercase().starts_with(prefix) {
+                    query = query[prefix.len()..].trim();
+                    break;
+                }
+            }
+            if !query.is_empty() {
+                return Some(query.to_string());
+            }
+        }
+
+        None
+    }
+
     fn deterministic_task_reminder_plan(context: &ControllerContext) -> Option<QueryPlan> {
         if context.observations.is_empty() {
-            if let Some((tool, title, due)) =
-                Self::parse_task_reminder_create(&context.request.text)
-            {
+            let (create_request, calendar_sync_requested) =
+                Self::strip_calendar_sync_suffix(&context.request.text);
+            if let Some((tool, title, due)) = Self::parse_task_reminder_create(&create_request) {
                 let mut arguments = serde_json::Map::new();
                 arguments.insert("operation".to_string(), serde_json::json!("create"));
                 arguments.insert("title".to_string(), serde_json::json!(title));
                 if let Some(due) = due {
                     arguments.insert("due".to_string(), serde_json::json!(due));
+                }
+                if tool == "reminders.mutate" && calendar_sync_requested {
+                    arguments.insert("calendar_sync".to_string(), serde_json::json!(true));
                 }
                 return Some(QueryPlan {
                     reasoning_summary: "Explicit task/reminder creation request.".to_string(),
@@ -1619,12 +1870,38 @@ impl LlamaCppController {
                 });
             }
 
+            if let Some(query) =
+                Self::calendar_sync_target_query(&context.request.text, &context.history)
+            {
+                return Some(QueryPlan {
+                    reasoning_summary: "Resolve the explicit reminder for Google Calendar sync."
+                        .to_string(),
+                    intent: QueryIntent::CallTool {
+                        tool: "reminders.list".to_string(),
+                        arguments: serde_json::json!({
+                            "query": query,
+                            "limit": 20
+                        }),
+                    },
+                });
+            }
+
             if let Some(target) = Self::parse_model_consultation(&context.request.text) {
                 return Some(QueryPlan {
                     reasoning_summary:
                         "Explicit request to delegate the current request to a cloud model."
                             .to_string(),
                     intent: QueryIntent::ConsultModel { target },
+                });
+            }
+
+            if let Some(scope) = Self::parse_system_info_request(&context.request.text) {
+                return Some(QueryPlan {
+                    reasoning_summary: "Explicit live system information request.".to_string(),
+                    intent: QueryIntent::CallTool {
+                        tool: "system.info".to_string(),
+                        arguments: serde_json::json!({"scope": scope}),
+                    },
                 });
             }
 
@@ -1658,6 +1935,62 @@ impl LlamaCppController {
         }
 
         let last = context.observations.last()?;
+
+        if let Some(query) =
+            Self::calendar_sync_target_query(&context.request.text, &context.history)
+        {
+            if !matches!(
+                &last.action,
+                ControllerAction::CallTool { tool, .. } if tool == "reminders.list"
+            ) {
+                return None;
+            }
+
+            let ActionResult::Tool { result } = &last.result else {
+                return None;
+            };
+            if !result.success {
+                return None;
+            }
+            let items = result.output.get("items")?.as_array()?;
+            if items.is_empty() {
+                return Some(QueryPlan {
+                    reasoning_summary: "No matching reminder was found for Google Calendar sync."
+                        .to_string(),
+                    intent: QueryIntent::Respond {
+                        text: format!("I couldn't find an active reminder matching '{}'.", query),
+                    },
+                });
+            }
+            if items.len() != 1 {
+                return Some(QueryPlan {
+                    reasoning_summary:
+                        "Multiple reminder matches require clarification before Calendar sync."
+                            .to_string(),
+                    intent: QueryIntent::Clarify {
+                        question: format!(
+                            "I found multiple active reminder matches for '{}'. Which one should be synced to Google Calendar?",
+                            query
+                        ),
+                    },
+                });
+            }
+
+            let id = items[0].get("id")?.as_str()?;
+            return Some(QueryPlan {
+                reasoning_summary: "The explicit reminder resolved to one item for Calendar sync."
+                    .to_string(),
+                intent: QueryIntent::CallTool {
+                    tool: "reminders.mutate".to_string(),
+                    arguments: serde_json::json!({
+                        "operation": "update",
+                        "id": id,
+                        "calendar_sync": true
+                    }),
+                },
+            });
+        }
+
         let (expected_tool, operation, query, due) =
             Self::parse_task_reminder_pending_mutation(&context.request.text)?;
         if !matches!(
@@ -1740,6 +2073,8 @@ Interpret the CURRENT USER REQUEST into exactly one structured intent.
 Do not plan or execute a sequence of future actions.
 The Rust orchestrator will validate the intent and perform execution.
 
+When the user asks about your capabilities, describe only capabilities currently available in this local runtime. Do not advertise Claude, Codex, or other cloud models unless the user explicitly asks about model consultation.
+
 Available intents:
 
 1. respond
@@ -1773,6 +2108,7 @@ Task/reminder behavior:
 - When the user says "called TITLE" or otherwise explicitly names a task/reminder title, treat that phrase as the exact title. Do not ask what the task or reminder refers to unless the user actually omitted the title.
 - Example: "Create a task called Review RCM report due tomorrow." means a tasks.mutate create call with title "Review RCM report" and due "tomorrow". Do not clarify the report identity or ask for a time.
 - For an update that clears a due time, pass due: null. Omit due when it should remain unchanged.
+- Reminder Calendar sync is opt-in per reminder. Pass calendar_sync: true only when the user explicitly asks to mirror that reminder to Google Calendar. Pass calendar_sync: false when the user explicitly disables it. Omit calendar_sync on updates when the existing choice should remain unchanged.
 - Task initial status is open. Reminder initial status is scheduled.
 - Available task operations: create, update, complete, cancel.
 - Available reminder operations: create, update, complete, cancel, trigger.
@@ -1782,6 +2118,7 @@ Available tools:
 files.read
 files.list
 memory.write
+system.info
 tasks.list
 tasks.mutate
 reminders.list
@@ -1790,16 +2127,16 @@ calendar.list_events
 calendar.get_event
 calendar.create_event
 calendar.update_event
-calendar.delete_event
 
-4. consult_model
-Use this only when the user explicitly asks to use Claude or Codex for the current request.
-Do not choose a cloud model merely because a request is difficult.
-The Rust orchestrator will send only the current user request to the selected cloud model.
-Never include memory, conversation history, execution trace, tool results, or hidden context.
-Only Claude and Codex are valid consult_model targets.
+system.info behavior:
+- Use system.info for live local machine or Zaraki runtime state, not persistent memory.
+- scope may be summary, hardware, runtime, network, or all.
+- Use runtime for active model, runtime readiness, service status, or socket state.
+- Use hardware for CPU, RAM, GPU/VRAM, storage, battery, OS, and kernel information.
+- Use network for interface and default-route state.
+- Do not expose secrets, OAuth tokens, client secrets, or environment dumps.
 
-5. clarify
+4. clarify
 Use this when the request is genuinely ambiguous or required information is
 missing and the available request/history/trace cannot resolve it.
 Ask one concise question that would resolve the ambiguity.
@@ -1992,13 +2329,13 @@ Context rules:
                         matches!(
                             tool.as_str(),
                             "files.read"
+                                | "system.info"
                                 | "memory.write"
                                 | "tasks.mutate"
                                 | "reminders.mutate"
                                 | "calendar.get_event"
                                 | "calendar.create_event"
                                 | "calendar.update_event"
-                                | "calendar.delete_event"
                         )
                     }
 
@@ -2136,6 +2473,7 @@ Context rules:
                                         "files.read",
                                         "files.list",
                                         "memory.write",
+                                        "system.info",
                                         "tasks.list",
                                         "tasks.mutate",
                                         "reminders.list",
@@ -2143,20 +2481,10 @@ Context rules:
                                         "calendar.list_events",
                                         "calendar.get_event",
                                         "calendar.create_event",
-                                        "calendar.update_event",
-                                        "calendar.delete_event"
+                                        "calendar.update_event"
                                     ]
                                 },
                                 "arguments": {"type": "object"}
-                            }
-                        },
-                        {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": ["kind", "target"],
-                            "properties": {
-                                "kind": {"const": "consult_model"},
-                                "target": {"enum": ["claude", "codex"]}
                             }
                         },
                         {
@@ -2258,7 +2586,7 @@ Context rules:
         for key in object.keys() {
             if !matches!(
                 key.as_str(),
-                "operation" | "id" | "title" | "body" | "due" | "status"
+                "operation" | "id" | "title" | "body" | "due" | "status" | "calendar_sync"
             ) {
                 return Err(format!("{tool} does not accept argument '{key}'.").into());
             }
@@ -2350,6 +2678,14 @@ Context rules:
                 return Err(format!("Invalid {tool} status '{value}'.").into());
             }
         }
+        if let Some(calendar_sync) = object.get("calendar_sync") {
+            if is_task {
+                return Err(format!("{tool} does not accept argument 'calendar_sync'.").into());
+            }
+            if !calendar_sync.is_boolean() {
+                return Err(format!("{tool} calendar_sync must be a boolean.").into());
+            }
+        }
 
         if matches!(operation.as_str(), "complete" | "cancel" | "trigger")
             && object
@@ -2360,11 +2696,17 @@ Context rules:
         }
 
         if operation == "update"
-            && !object
-                .keys()
-                .any(|key| matches!(key.as_str(), "title" | "body" | "due" | "status"))
+            && !object.keys().any(|key| {
+                matches!(
+                    key.as_str(),
+                    "title" | "body" | "due" | "status" | "calendar_sync"
+                )
+            })
         {
-            return Err(format!("{tool} update requires title, body, due, or status.").into());
+            return Err(format!(
+                "{tool} update requires title, body, due, status, or calendar_sync."
+            )
+            .into());
         }
 
         if operation == "create" && object.get("status").is_some() {
@@ -2811,49 +3153,33 @@ Context rules:
                         })
                     }
 
-                    "calendar.delete_event" => {
+                    "system.info" => {
                         let object = arguments
                             .as_object()
-                            .ok_or("calendar.delete_event arguments must be an object.")?;
+                            .ok_or("system.info arguments must be an object.")?;
 
                         for key in object.keys() {
-                            if !matches!(key.as_str(), "calendar_id" | "event_id" | "send_updates")
-                            {
+                            if key != "scope" {
                                 return Err(format!(
-                                    "calendar.delete_event does not accept argument '{key}'."
+                                    "system.info does not accept argument '{key}'."
                                 )
                                 .into());
                             }
                         }
 
-                        let event_id = object
-                            .get("event_id")
+                        let scope = object
+                            .get("scope")
                             .and_then(|value| value.as_str())
-                            .ok_or("calendar.delete_event requires event_id.")?;
-                        if event_id.trim().is_empty() {
-                            return Err("calendar.delete_event event_id cannot be empty.".into());
-                        }
+                            .unwrap_or("summary");
 
-                        if let Some(calendar_id) = object.get("calendar_id") {
-                            if !calendar_id.is_string()
-                                || calendar_id
-                                    .as_str()
-                                    .is_none_or(|text| text.trim().is_empty())
-                            {
-                                return Err(
-                                    "calendar.delete_event calendar_id must be a non-empty string."
-                                        .into(),
-                                );
-                            }
-                        }
-
-                        if let Some(send_updates) = object.get("send_updates") {
-                            let value = send_updates
-                                .as_str()
-                                .ok_or("calendar.delete_event send_updates must be a string.")?;
-                            if !matches!(value, "all" | "externalOnly" | "none") {
-                                return Err("calendar.delete_event send_updates is invalid.".into());
-                            }
+                        if !matches!(
+                            scope,
+                            "summary" | "hardware" | "runtime" | "network" | "all"
+                        ) {
+                            return Err(
+                                "system.info scope must be summary, hardware, runtime, network, or all."
+                                    .into(),
+                            );
                         }
 
                         Ok(ControllerAction::CallTool {
@@ -3222,7 +3548,8 @@ impl QueryPlanner for LlamaCppController {
             .content
             .clone();
 
-        Self::parse_query_plan(&content)
+        let plan = Self::parse_query_plan(&content)?;
+        Self::reject_model_selected_cloud_consultation(plan)
     }
 }
 
@@ -3251,6 +3578,99 @@ mod controller_tests {
         });
 
         Ok(LlamaCppController::parse_query_plan(&value.to_string())?)
+    }
+
+    #[test]
+    fn system_info_requests_are_deterministic() {
+        assert_eq!(
+            LlamaCppController::parse_system_info_request("Which model am I talking to?"),
+            Some("runtime")
+        );
+        assert_eq!(
+            LlamaCppController::parse_system_info_request("What are my machine specs?"),
+            Some("all")
+        );
+        assert_eq!(
+            LlamaCppController::parse_system_info_request("How much RAM do I have?"),
+            Some("hardware")
+        );
+        assert_eq!(
+            LlamaCppController::parse_system_info_request("What's my network status?"),
+            Some("network")
+        );
+        assert_eq!(
+            LlamaCppController::parse_system_info_request(
+                "What do you remember about my GPU purchase?"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn system_info_tool_intent_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let plan = parse_intent(serde_json::json!({
+            "kind": "call_tool",
+            "tool": "system.info",
+            "arguments": {"scope": "hardware"}
+        }))?;
+
+        assert_eq!(
+            plan.intent,
+            QueryIntent::CallTool {
+                tool: "system.info".to_string(),
+                arguments: serde_json::json!({"scope": "hardware"}),
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_cloud_request_takes_precedence_over_system_info()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let context = ControllerContext {
+            request: UserRequest {
+                text: "Ask Claude which model I am talking to.".to_string(),
+            },
+            history: String::new(),
+            observations: Vec::new(),
+        };
+
+        let plan = LlamaCppController::deterministic_task_reminder_plan(&context)
+            .ok_or("explicit cloud request did not produce a deterministic plan")?;
+
+        assert_eq!(
+            plan.intent,
+            QueryIntent::ConsultModel {
+                target: ModelTarget::Claude,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn deterministic_system_info_plan_uses_system_tool() -> Result<(), Box<dyn std::error::Error>> {
+        let context = ControllerContext {
+            request: UserRequest {
+                text: "Which model am I talking to?".to_string(),
+            },
+            history: String::new(),
+            observations: Vec::new(),
+        };
+
+        let plan = LlamaCppController::deterministic_task_reminder_plan(&context)
+            .ok_or("system info request did not produce a deterministic plan")?;
+
+        assert_eq!(
+            plan.intent,
+            QueryIntent::CallTool {
+                tool: "system.info".to_string(),
+                arguments: serde_json::json!({"scope": "runtime"}),
+            }
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -3441,7 +3861,7 @@ mod controller_tests {
         let intent = &LlamaCppController::query_plan_schema()["properties"]["intent"];
         let branches = intent["oneOf"].as_array().expect("intent oneOf missing");
 
-        assert_eq!(branches.len(), 5);
+        assert_eq!(branches.len(), 4);
 
         assert_eq!(branches[0]["required"], serde_json::json!(["kind", "text"]));
         assert_eq!(
@@ -3454,12 +3874,17 @@ mod controller_tests {
         );
         assert_eq!(
             branches[3]["required"],
-            serde_json::json!(["kind", "target"])
-        );
-        assert_eq!(
-            branches[4]["required"],
             serde_json::json!(["kind", "question"])
         );
+
+        for branch in branches {
+            assert_ne!(
+                branch["properties"]["kind"]
+                    .get("const")
+                    .and_then(|value| value.as_str()),
+                Some("consult_model")
+            );
+        }
 
         let tools = branches[2]["properties"]["tool"]["enum"]
             .as_array()
@@ -3550,6 +3975,224 @@ mod controller_tests {
             Some((
                 "reminders.mutate",
                 "Call Mom".to_string(),
+                Some("tomorrow".to_string()),
+            ))
+        );
+    }
+
+    #[test]
+    fn conversational_task_creation_strips_wrapping_quotes_from_title() {
+        let parsed = LlamaCppController::parse_task_reminder_create(
+            r#"Create a task called "Obsidian integration test" due tomorrow at 10 AM."#,
+        );
+
+        assert_eq!(
+            parsed,
+            Some((
+                "tasks.mutate",
+                "Obsidian integration test".to_string(),
+                Some("tomorrow at 10 AM".to_string()),
+            ))
+        );
+    }
+
+    #[test]
+    fn conversational_reminder_creation_extracts_leading_due_clause() {
+        let parsed = LlamaCppController::parse_task_reminder_create(
+            "Remind me tomorrow at 11 AM to check the Obsidian integration.",
+        );
+
+        assert_eq!(
+            parsed,
+            Some((
+                "reminders.mutate",
+                "check the Obsidian integration".to_string(),
+                Some("tomorrow at 11 AM".to_string()),
+            ))
+        );
+    }
+
+    #[test]
+    fn conversational_reminder_creation_accepts_relative_due_phrase() {
+        for (request, expected_due) in [
+            (
+                "Remind me in half an hour to test Chat approval.",
+                "in half an hour",
+            ),
+            (
+                "Remind me in 5 minutes to test Chat approval.",
+                "in 5 minutes",
+            ),
+        ] {
+            let parsed = LlamaCppController::parse_task_reminder_create(request);
+
+            assert_eq!(
+                parsed,
+                Some((
+                    "reminders.mutate",
+                    "test Chat approval".to_string(),
+                    Some(expected_due.to_string()),
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn deterministic_reminder_creation_uses_relative_due_phrase()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let context = ControllerContext {
+            request: UserRequest {
+                text: "Remind me in 5 minutes to test Chat approval.".to_string(),
+            },
+            history: String::new(),
+            observations: Vec::new(),
+        };
+
+        let plan = LlamaCppController::deterministic_task_reminder_plan(&context)
+            .ok_or("relative reminder request did not produce a deterministic plan")?;
+
+        assert_eq!(
+            plan.intent,
+            QueryIntent::CallTool {
+                tool: "reminders.mutate".to_string(),
+                arguments: serde_json::json!({
+                    "operation": "create",
+                    "title": "test Chat approval",
+                    "due": "in 5 minutes",
+                }),
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn deterministic_reminder_creation_can_request_calendar_sync()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let context = ControllerContext {
+            request: UserRequest {
+                text: "Remind me to test Chat approval at 15:00 and sync it to Google Calendar."
+                    .to_string(),
+            },
+            history: String::new(),
+            observations: Vec::new(),
+        };
+
+        let plan = LlamaCppController::deterministic_task_reminder_plan(&context)
+            .ok_or("calendar-sync reminder request did not produce a deterministic plan")?;
+
+        assert_eq!(
+            plan.intent,
+            QueryIntent::CallTool {
+                tool: "reminders.mutate".to_string(),
+                arguments: serde_json::json!({
+                    "operation": "create",
+                    "title": "test Chat approval",
+                    "due": "at 15:00",
+                    "calendar_sync": true
+                }),
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn calendar_sync_followup_resolves_the_recently_created_reminder()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let context = ControllerContext {
+            request: UserRequest {
+                text: "Sync it to Google Calendar too.".to_string(),
+            },
+            history: r#"USER:
+Remind me to test Chat approval at 15:00.
+
+ASSISTANT:
+Reminder created: 'test Chat approval' scheduled for today at 15:00."#
+                .to_string(),
+            observations: Vec::new(),
+        };
+
+        let plan = LlamaCppController::deterministic_task_reminder_plan(&context)
+            .ok_or("calendar-sync followup did not produce a deterministic plan")?;
+
+        assert_eq!(
+            plan.intent,
+            QueryIntent::CallTool {
+                tool: "reminders.list".to_string(),
+                arguments: serde_json::json!({
+                    "query": "test Chat approval",
+                    "limit": 20
+                }),
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn calendar_sync_followup_updates_the_unique_matching_reminder()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let context = ControllerContext {
+            request: UserRequest {
+                text: "Sync it to Google Calendar too.".to_string(),
+            },
+            history: r#"USER:
+Remind me to test Chat approval at 15:00.
+
+ASSISTANT:
+Reminder created: 'test Chat approval' scheduled for today at 15:00."#
+                .to_string(),
+            observations: vec![OrchestrationTrace {
+                step: 0,
+                action: ControllerAction::CallTool {
+                    tool: "reminders.list".to_string(),
+                    arguments: serde_json::json!({
+                        "query": "test Chat approval",
+                        "limit": 20
+                    }),
+                },
+                result: ActionResult::Tool {
+                    result: ToolResult {
+                        success: true,
+                        output: serde_json::json!({
+                            "items": [
+                                {"id": "reminder:test-1", "title": "test Chat approval"}
+                            ]
+                        }),
+                    },
+                },
+            }],
+        };
+
+        let plan = LlamaCppController::deterministic_task_reminder_plan(&context)
+            .ok_or("calendar-sync followup did not produce a mutation plan")?;
+
+        assert_eq!(
+            plan.intent,
+            QueryIntent::CallTool {
+                tool: "reminders.mutate".to_string(),
+                arguments: serde_json::json!({
+                    "operation": "update",
+                    "id": "reminder:test-1",
+                    "calendar_sync": true
+                }),
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn conversational_reminder_creation_preserves_remind_me_to() {
+        let parsed =
+            LlamaCppController::parse_task_reminder_create("Remind me to call Mom tomorrow.");
+
+        assert_eq!(
+            parsed,
+            Some((
+                "reminders.mutate",
+                "call Mom".to_string(),
                 Some("tomorrow".to_string()),
             ))
         );
@@ -3810,16 +4453,6 @@ mod controller_tests {
             QueryIntent::CallTool { tool, .. } if tool == "calendar.update_event"
         ));
 
-        let delete = parse_intent(serde_json::json!({
-            "kind": "call_tool",
-            "tool": "calendar.delete_event",
-            "arguments": {"event_id": "evt-1"}
-        }))?;
-        assert!(matches!(
-            delete.intent,
-            QueryIntent::CallTool { tool, .. } if tool == "calendar.delete_event"
-        ));
-
         let list = parse_intent(serde_json::json!({
             "kind": "call_tool",
             "tool": "calendar.list_events",
@@ -3875,6 +4508,24 @@ mod controller_tests {
             "target": "qwen"
         }));
         assert!(invalid.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn model_selected_cloud_consultation_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let plan = parse_intent(serde_json::json!({
+            "kind": "consult_model",
+            "target": "claude"
+        }))?;
+
+        let error = LlamaCppController::reject_model_selected_cloud_consultation(plan)
+            .expect_err("model-generated cloud consultation should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("Cloud model consultation requires an explicit user request")
+        );
 
         Ok(())
     }
@@ -4802,7 +5453,8 @@ mod controller_tests {
             "arguments": {
                 "operation": "create",
                 "title": "Submit application",
-                "due": "tomorrow at 6 PM"
+                "due": "tomorrow at 6 PM",
+                "calendar_sync": true
             }
         }))?;
         assert!(
@@ -4835,6 +5487,28 @@ mod controller_tests {
         }));
         assert!(extra.is_err());
 
+        let invalid_calendar_sync = parse_intent(serde_json::json!({
+            "kind": "call_tool",
+            "tool": "reminders.mutate",
+            "arguments": {
+                "operation": "create",
+                "title": "x",
+                "calendar_sync": "yes"
+            }
+        }));
+        assert!(invalid_calendar_sync.is_err());
+
+        let task_calendar_sync = parse_intent(serde_json::json!({
+            "kind": "call_tool",
+            "tool": "tasks.mutate",
+            "arguments": {
+                "operation": "create",
+                "title": "x",
+                "calendar_sync": true
+            }
+        }));
+        assert!(task_calendar_sync.is_err());
+
         Ok(())
     }
 
@@ -4854,12 +5528,12 @@ mod controller_tests {
         });
         assert!(parse_intent(empty_update).is_err());
 
-        let invalid_delete = serde_json::json!({
+        let delete = serde_json::json!({
             "kind": "call_tool",
             "tool": "calendar.delete_event",
-            "arguments": {"event_id": "evt-1", "send_updates": "sometimes"}
+            "arguments": {"event_id": "evt-1"}
         });
-        assert!(parse_intent(invalid_delete).is_err());
+        assert!(parse_intent(delete).is_err());
 
         let too_many = serde_json::json!({
             "kind": "call_tool",
@@ -6168,6 +6842,17 @@ struct ProposalPayload {
 }
 
 impl PersistentMemoryIndexer {
+    /// Returns whether any background job is currently running without requiring
+    /// access to the orchestrator mutex. Runtime lifecycle checks call this from
+    /// the IPC accept loop, so it must never depend on the orchestrator lock.
+    pub fn has_running_jobs(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| "Persistent memory indexer database mutex was poisoned.")?;
+        Ok(!db.jobs(Some("running"), 1000)?.is_empty())
+    }
+
     pub fn new(
         db_path: impl AsRef<std::path::Path>,
         memory_root: impl AsRef<std::path::Path>,
@@ -6483,6 +7168,20 @@ impl PersistentMemoryIndexer {
         Ok(paths)
     }
 
+    pub fn refresh_index_without_embeddings(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = indexer::build_snapshot_from(&self.memory_root)?;
+
+        let mut db = self
+            .db
+            .lock()
+            .map_err(|_| "Persistent memory indexer database mutex was poisoned.")?;
+
+        db.sync_snapshot(&snapshot)?;
+        db.sync_semantics(&snapshot)?;
+
+        Ok(())
+    }
+
     pub fn refresh(&self) -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = indexer::build_snapshot_from(&self.memory_root)?;
 
@@ -6554,6 +7253,89 @@ mod persistent_memory_proposal_tests {
             }
         });
         Ok((format!("http://{}", address), handle))
+    }
+
+    #[test]
+    fn persistent_memory_indexer_reports_running_jobs_without_orchestrator_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let memory_root = root.path().join("memory");
+        std::fs::create_dir_all(&memory_root)?;
+        let database = root.path().join("assistant.db");
+
+        let indexer = PersistentMemoryIndexer::new(
+            &database,
+            &memory_root,
+            "http://127.0.0.1:1",
+            "test-embedding-model",
+        )?;
+
+        assert!(!indexer.has_running_jobs()?);
+
+        let db = sqlite_memory::SqliteMemoryDb::open(&database)?;
+        db.initialize_schema()?;
+        let id = db.enqueue_job(
+            "test-running-job",
+            None,
+            None,
+            0,
+            Some("2099-01-01T00:00:00Z"),
+        )?;
+        assert!(db.claim_next_job("2099-01-01T00:00:00Z")?.is_some());
+        assert_eq!(
+            db.job(&id)?.expect("job missing").status,
+            sqlite_memory::JobStatus::Running
+        );
+
+        assert!(indexer.has_running_jobs()?);
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_refresh_reconciles_reminder_due_without_embeddings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let memory_root = root.path().join("memory");
+        let reminder_root = memory_root.join("journal/reminders");
+        std::fs::create_dir_all(&reminder_root)?;
+        let database = root.path().join("assistant.db");
+
+        std::fs::write(
+            reminder_root.join("reminder-test.md"),
+            r#"---
+id: "reminder-test"
+title: "Calendar test"
+type: "journal"
+memory_kind: "reminder"
+reminder_status: "scheduled"
+due_at: "2026-09-22T19:50:00Z"
+created_at: "2026-09-22T18:00:00Z"
+updated_at: "2026-09-22T18:00:00Z"
+calendar_sync_enabled: "true"
+calendar_sync_status: "synced"
+google_event_id: "event-123"
+---
+
+Verify calendar sync.
+"#,
+        )?;
+
+        let indexer = PersistentMemoryIndexer::new(
+            &database,
+            &memory_root,
+            "http://127.0.0.1:9",
+            "unused.gguf",
+        )?;
+        indexer.refresh_index_without_embeddings()?;
+
+        let db = sqlite_memory::SqliteMemoryDb::open(&database)?;
+        let reminder = db
+            .reminder("reminder:reminder-test")?
+            .ok_or("Reminder was not indexed.")?;
+
+        assert_eq!(reminder.due_at.as_deref(), Some("2026-09-22T19:50:00Z"));
+        assert_eq!(reminder.status, "scheduled");
+        Ok(())
     }
 
     #[test]

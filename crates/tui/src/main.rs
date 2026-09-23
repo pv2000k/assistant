@@ -10,7 +10,10 @@ use std::{
 };
 
 use assistant_client::{ClientLease, IpcClient, IpcClientError, default_socket_path};
-use assistant_protocol::{ChatResponse, HealthStatus, ModelState, RequestMethod, ResponsePayload};
+use assistant_protocol::{
+    ApprovalRequestSummary, ApprovalStatus, CalendarStatus, ChatResponse, HealthStatus, ModelState,
+    RequestMethod, ResponsePayload,
+};
 use crossterm::{
     Command,
     event::{
@@ -39,7 +42,7 @@ use startup::{
     runtime_binary_path,
 };
 
-const TABS: [&str; 8] = [
+const TABS: [&str; 9] = [
     "Overview",
     "Tasks",
     "Reminders",
@@ -48,10 +51,13 @@ const TABS: [&str; 8] = [
     "Models",
     "Jobs",
     "Search",
+    "Calendar",
 ];
 
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+const APPROVAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CHAT_TIMEOUT: Duration = Duration::from_secs(130);
+const REMINDER_MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_EDITOR_LINES: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +70,7 @@ enum Tab {
     Models,
     Jobs,
     Search,
+    Calendar,
 }
 
 impl Tab {
@@ -77,6 +84,7 @@ impl Tab {
             Self::Models => 5,
             Self::Jobs => 6,
             Self::Search => 7,
+            Self::Calendar => 8,
         }
     }
 
@@ -89,7 +97,8 @@ impl Tab {
             4 => Self::Chat,
             5 => Self::Models,
             6 => Self::Jobs,
-            _ => Self::Search,
+            7 => Self::Search,
+            _ => Self::Calendar,
         }
     }
 }
@@ -151,6 +160,8 @@ struct UiReminder {
     due_at: Option<String>,
     created_at: String,
     updated_at: String,
+    calendar_sync_enabled: bool,
+    calendar_sync_status: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,12 +186,6 @@ struct UiModel {
     available: bool,
     active: bool,
     capabilities: Vec<String>,
-    location: String,
-    endpoint: String,
-    context: String,
-    vram: String,
-    pid: String,
-    speed: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +194,17 @@ struct UiJob {
     job_type: String,
     status: String,
     next_run_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UiCalendarEvent {
+    id: String,
+    summary: String,
+    status: String,
+    start: String,
+    end: String,
+    location: String,
+    html_link: String,
 }
 
 #[cfg(test)]
@@ -285,6 +301,8 @@ fn demo_reminders() -> Vec<UiReminder> {
             due_at: Some("21-09-26 19:00".into()),
             created_at: "21-09-26 12:00".into(),
             updated_at: "21-09-26 12:00".into(),
+            calendar_sync_enabled: false,
+            calendar_sync_status: Some("disabled".into()),
         },
         UiReminder {
             id: "demo-reminder-2".into(),
@@ -294,6 +312,8 @@ fn demo_reminders() -> Vec<UiReminder> {
             due_at: Some("22-09-26 09:30".into()),
             created_at: "21-09-26 12:10".into(),
             updated_at: "21-09-26 12:10".into(),
+            calendar_sync_enabled: false,
+            calendar_sync_status: Some("disabled".into()),
         },
         UiReminder {
             id: "demo-reminder-3".into(),
@@ -303,6 +323,8 @@ fn demo_reminders() -> Vec<UiReminder> {
             due_at: Some("21-09-26 13:00".into()),
             created_at: "21-09-26 09:00".into(),
             updated_at: "21-09-26 13:05".into(),
+            calendar_sync_enabled: false,
+            calendar_sync_status: Some("disabled".into()),
         },
         UiReminder {
             id: "demo-reminder-4".into(),
@@ -312,6 +334,8 @@ fn demo_reminders() -> Vec<UiReminder> {
             due_at: Some("21-09-26 14:30".into()),
             created_at: "21-09-26 10:30".into(),
             updated_at: "21-09-26 14:45".into(),
+            calendar_sync_enabled: false,
+            calendar_sync_status: Some("disabled".into()),
         },
     ]
 }
@@ -321,8 +345,20 @@ struct PendingChat {
     receiver: Receiver<Result<String, String>>,
 }
 
+struct PendingApprovalPoll {
+    receiver: Receiver<Result<Vec<ApprovalRequestSummary>, String>>,
+}
+
+struct PendingApprovalResponse {
+    receiver: Receiver<Result<ApprovalStatus, String>>,
+}
+
 struct PendingRuntimeRestart {
     receiver: Receiver<Result<(), String>>,
+}
+
+struct PendingCalendarLogin {
+    receiver: Receiver<Result<String, String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,6 +369,8 @@ enum Modal {
     ReminderDetail,
     ProposalDetail,
     SearchDetail,
+    CalendarDetail,
+    Approval(u64),
     RuntimeReconnect,
 }
 
@@ -394,7 +432,7 @@ impl FormState {
         form.editing_id = Some(task.id.clone());
         form.values[0] = task.title.clone();
         form.values[1] = task.body.clone();
-        form.values[2] = task.due_at.clone().unwrap_or_default();
+        form.values[2] = format_due_input(task.due_at.as_deref());
         form.values[3] = task.status.clone();
         form.values[4] = task.priority.clone();
         form.values[5] = task.project.clone().unwrap_or_default();
@@ -406,8 +444,18 @@ impl FormState {
         Self {
             kind: FormKind::Reminder,
             editing_id: None,
-            labels: vec!["Title".to_string(), "Body".to_string(), "Due".to_string()],
-            values: vec![String::new(), String::new(), String::new()],
+            labels: vec![
+                "Title".to_string(),
+                "Body".to_string(),
+                "Due".to_string(),
+                "Calendar Sync".to_string(),
+            ],
+            values: vec![
+                String::new(),
+                String::new(),
+                String::new(),
+                "no".to_string(),
+            ],
             active: 0,
             cursor: 0,
             validation_error: None,
@@ -419,7 +467,12 @@ impl FormState {
         form.editing_id = Some(reminder.id.clone());
         form.values[0] = reminder.title.clone();
         form.values[1] = reminder.body.clone();
-        form.values[2] = reminder.due_at.clone().unwrap_or_default();
+        form.values[2] = format_due_input(reminder.due_at.as_deref());
+        form.values[3] = if reminder.calendar_sync_enabled {
+            "yes".to_string()
+        } else {
+            "no".to_string()
+        };
         form.cursor = form.values[0].chars().count();
         form
     }
@@ -476,9 +529,16 @@ struct App {
     reminders: Vec<UiReminder>,
     proposals: Vec<UiProposal>,
     jobs: Vec<UiJob>,
+    calendar_status: Option<CalendarStatus>,
+    calendar_events: Vec<UiCalendarEvent>,
+    system_info: Option<serde_json::Value>,
     chat: Vec<ChatExchange>,
     pending_chat: Option<PendingChat>,
+    approvals: Vec<ApprovalRequestSummary>,
+    pending_approval_poll: Option<PendingApprovalPoll>,
+    pending_approval_response: Option<PendingApprovalResponse>,
     pending_runtime_restart: Option<PendingRuntimeRestart>,
+    pending_calendar_login: Option<PendingCalendarLogin>,
     tab: Tab,
     selected: usize,
     input_mode: InputMode,
@@ -497,6 +557,7 @@ struct App {
     session_title: String,
     attachment: Option<PathBuf>,
     last_health_check: Instant,
+    last_approval_poll: Instant,
     runtime_reconnect_offered: bool,
     last_layout: UiRects,
 }
@@ -507,6 +568,8 @@ impl App {
         let mut app = Self::from_client(lease, client, socket_path);
         if let Err(error) = app.refresh() {
             app.message = format!("Runtime unavailable: {error}");
+        } else if let Err(error) = app.load_session_history() {
+            app.notify(format!("Session history unavailable: {error}"));
         }
         Ok(app)
     }
@@ -524,9 +587,16 @@ impl App {
             reminders: Vec::new(),
             proposals: Vec::new(),
             jobs: Vec::new(),
+            calendar_status: None,
+            calendar_events: Vec::new(),
+            system_info: None,
             chat: Vec::new(),
             pending_chat: None,
+            approvals: Vec::new(),
+            pending_approval_poll: None,
+            pending_approval_response: None,
             pending_runtime_restart: None,
+            pending_calendar_login: None,
             tab: Tab::Overview,
             selected: 0,
             input_mode: InputMode::None,
@@ -545,6 +615,7 @@ impl App {
             session_title: "New session".to_string(),
             attachment: None,
             last_health_check: Instant::now() - HEALTH_CHECK_INTERVAL,
+            last_approval_poll: Instant::now() - APPROVAL_POLL_INTERVAL,
             runtime_reconnect_offered: false,
             last_layout: UiRects {
                 header: Rect::default(),
@@ -593,6 +664,13 @@ impl App {
         sort_ui_proposals(&mut self.proposals);
         self.jobs = self.request_jobs()?;
         sort_ui_jobs(&mut self.jobs);
+        self.system_info = self.request_system_info().ok();
+        if let Ok((status, events)) = self.request_calendar_snapshot() {
+            self.calendar_status = Some(status);
+            self.calendar_events = events;
+        } else {
+            self.calendar_events.clear();
+        }
         if self.tab == Tab::Search && !self.search_input.trim().is_empty() {
             let query = self.search_input.trim().to_string();
             match self.request_memory_search(&query) {
@@ -603,6 +681,39 @@ impl App {
         self.normalize_selection();
         self.last_health_check = Instant::now();
         self.runtime_reconnect_offered = false;
+        Ok(())
+    }
+
+    fn request_session_history(
+        &self,
+    ) -> Result<assistant_protocol::SessionHistoryResponse, IpcClientError> {
+        match self
+            .client
+            .request(RequestMethod::SessionHistory { limit: Some(100) })?
+        {
+            ResponsePayload::SessionHistory(history) => Ok(history),
+            other => Err(unexpected_response("session history", other)),
+        }
+    }
+
+    fn load_session_history(&mut self) -> Result<(), IpcClientError> {
+        let history = self.request_session_history()?;
+        self.chat = history
+            .turns
+            .into_iter()
+            .map(|turn| ChatExchange {
+                user: turn.user,
+                assistant: Some(turn.assistant),
+            })
+            .collect();
+        self.session_title = self
+            .chat
+            .first()
+            .map(|exchange| compact(&exchange.user.replace(['\n', '\r'], " "), 48))
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| "New session".to_string());
+        self.selected = self.chat.len().saturating_sub(1);
+        self.chat_scroll = if self.chat.is_empty() { 0 } else { u16::MAX };
         Ok(())
     }
 
@@ -680,6 +791,63 @@ impl App {
         Ok(list.jobs.into_iter().map(ui_job_from_backend).collect())
     }
 
+    fn request_system_info(&self) -> Result<serde_json::Value, IpcClientError> {
+        match self.client.request(RequestMethod::SystemInfo {
+            scope: Some("all".to_string()),
+        })? {
+            ResponsePayload::SystemInfo(value) => Ok(value),
+            other => Err(unexpected_response("system info", other)),
+        }
+    }
+
+    fn request_calendar_snapshot(
+        &self,
+    ) -> Result<(CalendarStatus, Vec<UiCalendarEvent>), IpcClientError> {
+        let status = match self.client.request(RequestMethod::CalendarStatus)? {
+            ResponsePayload::CalendarStatus(value) => value,
+            other => return Err(unexpected_response("calendar status", other)),
+        };
+        if !status.authenticated {
+            return Ok((status, Vec::new()));
+        }
+
+        let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+        let month_start = now.date().replace_day(1).unwrap_or(now.date());
+        let next_month = month_start
+            .checked_add(time::Duration::days(32))
+            .and_then(|date| date.replace_day(1).ok())
+            .unwrap_or(month_start);
+        let time_min = month_start
+            .midnight()
+            .assume_offset(now.offset())
+            .format(&Rfc3339)
+            .ok();
+        let time_max = next_month
+            .midnight()
+            .assume_offset(now.offset())
+            .format(&Rfc3339)
+            .ok();
+        let client = IpcClient::new(&self.socket_path).with_timeout(Duration::from_secs(3));
+        let response = client.request(RequestMethod::CalendarEventsList {
+            calendar_id: Some(status.calendar_id.clone()),
+            time_min,
+            time_max,
+            query: None,
+            max_results: Some(250),
+            page_token: None,
+        })?;
+        let ResponsePayload::CalendarEvents(list) = response else {
+            return Err(unexpected_response("calendar events", response));
+        };
+        let mut events = list
+            .events
+            .into_iter()
+            .filter_map(ui_calendar_event_from_backend)
+            .collect::<Vec<_>>();
+        events.sort_by(|a, b| a.start.cmp(&b.start).then(a.summary.cmp(&b.summary)));
+        Ok((status, events))
+    }
+
     fn request_memory_search(
         &self,
         query: &str,
@@ -714,21 +882,17 @@ impl App {
             Tab::Reminders => self.reminders.len(),
             Tab::Proposals => self.proposals.len(),
             Tab::Chat => self.chat.len(),
-            Tab::Models => self.available_model_count(),
+            Tab::Models => self.models.len(),
             Tab::Jobs => self.jobs.len(),
             Tab::Search => self.search_results.len(),
+            Tab::Calendar => self.calendar_events.len(),
         }
-    }
-
-    fn available_model_count(&self) -> usize {
-        self.models.iter().filter(|model| model.available).count()
     }
 
     fn selected_available_model(&self) -> Option<&UiModel> {
         self.models
-            .iter()
+            .get(self.selected)
             .filter(|model| model.available)
-            .nth(self.selected)
     }
 
     fn set_tab(&mut self, tab: Tab) {
@@ -793,35 +957,37 @@ impl App {
     }
 
     fn overview_rows(&self) -> Vec<RowKind> {
-        let mut rows = Vec::new();
-        for index in self.important_task_indices() {
-            rows.push(RowKind::Task(index));
-        }
-        if rows.is_empty() {
-            for index in self.important_reminder_indices() {
-                rows.push(RowKind::Reminder(index));
-            }
-        } else {
-            rows.extend(
-                self.important_reminder_indices()
-                    .into_iter()
-                    .take(3)
-                    .map(RowKind::Reminder),
-            );
-        }
+        let mut rows = self
+            .important_task_indices()
+            .into_iter()
+            .map(RowKind::Task)
+            .collect::<Vec<_>>();
+        rows.extend(
+            self.important_reminder_indices()
+                .into_iter()
+                .take(3)
+                .map(RowKind::Reminder),
+        );
         rows
     }
 
     fn important_task_indices(&self) -> Vec<usize> {
-        self.tasks
+        let mut indices = self
+            .tasks
             .iter()
             .enumerate()
             .filter(|(_, task)| {
                 !matches!(task.status.as_str(), "completed" | "cancelled" | "archived")
             })
-            .take(6)
             .map(|(index, _)| index)
-            .collect()
+            .collect::<Vec<_>>();
+        let today = OffsetDateTime::now_local()
+            .unwrap_or_else(|_| OffsetDateTime::now_utc())
+            .date();
+        indices.sort_by(|left, right| {
+            compare_overview_tasks(&self.tasks[*left], &self.tasks[*right], today)
+        });
+        indices
     }
 
     fn important_reminder_indices(&self) -> Vec<usize> {
@@ -872,6 +1038,10 @@ impl App {
 
     fn selected_search(&self) -> Option<&(String, String, f64)> {
         self.search_results.get(self.selected)
+    }
+
+    fn selected_calendar_event(&self) -> Option<&UiCalendarEvent> {
+        self.calendar_events.get(self.selected)
     }
 
     fn accept_selected_proposal(&mut self) {
@@ -990,6 +1160,62 @@ impl App {
         }
     }
 
+    fn poll_calendar_login(&mut self) {
+        let Some(pending) = self.pending_calendar_login.as_ref() else {
+            return;
+        };
+
+        match pending.receiver.try_recv() {
+            Ok(Ok(message)) => {
+                self.pending_calendar_login = None;
+                self.notify(message);
+            }
+            Ok(Err(error)) => {
+                self.pending_calendar_login = None;
+                self.notify(format!("Google Calendar login failed: {error}"));
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.pending_calendar_login = None;
+                self.notify("Google Calendar login worker disconnected.".to_string());
+            }
+        }
+    }
+
+    fn start_calendar_login(&mut self) {
+        if self.pending_calendar_login.is_some() {
+            self.notify("Google Calendar login is already in progress.".to_string());
+            return;
+        }
+
+        let socket_path = self.socket_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let client = IpcClient::new(socket_path).with_timeout(Duration::from_secs(600));
+            let result = match client.request(RequestMethod::CalendarLogin) {
+                Ok(ResponsePayload::CalendarStatus(status)) if status.authenticated => Ok(format!(
+                    "Google Calendar authenticated. Write access: {}. Calendar: {}.",
+                    if status.write_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    status.calendar_id
+                )),
+                Ok(ResponsePayload::CalendarStatus(status)) => Err(format!(
+                    "Google Calendar is not authenticated after login (configured={}, calendar={}).",
+                    status.configured, status.calendar_id
+                )),
+                Ok(other) => Err(format!("Unexpected Calendar login response: {other:?}")),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = sender.send(result);
+        });
+
+        self.pending_calendar_login = Some(PendingCalendarLogin { receiver });
+        self.notify("Opening Google Calendar authorization in your browser...".to_string());
+    }
+
     fn run_search(&mut self) {
         let query = self.search_input.trim().to_string();
         if query.is_empty() {
@@ -1020,7 +1246,7 @@ impl App {
             return;
         }
         let text = self.chat_input.trim_end().to_string();
-        if text.trim().is_empty() {
+        if text.trim().is_empty() && self.attachment.is_none() {
             return;
         }
         if text.starts_with(':') {
@@ -1028,13 +1254,29 @@ impl App {
             return;
         }
 
+        let attachment = self.attachment.take();
+        let attachment_label = attachment.as_ref().map(|path| {
+            format!(
+                "[Attachment: {}]",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("file")
+            )
+        });
+        let display_text = match (&text, attachment_label) {
+            (text, Some(label)) if text.trim().is_empty() => label,
+            (text, Some(label)) => format!("{text}\n{label}"),
+            (text, None) => text.clone(),
+        };
+
         self.chat_input.clear();
         self.chat_cursor = 0;
         self.input_scroll = 0;
         self.input_mode = InputMode::None;
         if self.session_title == "New session" {
             self.session_title = compact(
-                text.split_whitespace()
+                display_text
+                    .split_whitespace()
                     .collect::<Vec<_>>()
                     .join(" ")
                     .as_str(),
@@ -1043,7 +1285,7 @@ impl App {
         }
         let exchange_index = self.chat.len();
         self.chat.push(ChatExchange {
-            user: text.clone(),
+            user: display_text,
             assistant: None,
         });
         self.selected = exchange_index;
@@ -1051,14 +1293,21 @@ impl App {
         let socket_path = self.socket_path.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
+            let attachments = attachment
+                .into_iter()
+                .map(|path| assistant_protocol::ChatAttachment {
+                    path: path.display().to_string(),
+                })
+                .collect();
             let client = IpcClient::new(socket_path).with_timeout(CHAT_TIMEOUT);
-            let result = match client.request(RequestMethod::Chat { text }) {
+            let result = match client.request(RequestMethod::Chat { text, attachments }) {
                 Ok(ResponsePayload::Chat(ChatResponse { text })) => Ok(text),
                 Ok(other) => Err(format!("Unexpected chat response: {other:?}")),
                 Err(error) => Err(format!("Chat failed: {error}")),
             };
             let _ = sender.send(result);
         });
+        self.last_approval_poll = Instant::now() - APPROVAL_POLL_INTERVAL;
         self.pending_chat = Some(PendingChat {
             exchange_index,
             receiver,
@@ -1070,16 +1319,31 @@ impl App {
         let command = parts.next().unwrap_or("");
         let arg = parts.next().unwrap_or("").trim();
         match command {
-            ":new" => {
-                self.chat.clear();
-                self.session_title = "New session".to_string();
-                self.notify("Started a new chat session.".to_string());
-            }
+            ":new" => match self.client.request(RequestMethod::SessionNew) {
+                Ok(ResponsePayload::Session(_)) => {
+                    self.chat.clear();
+                    self.session_title = "New session".to_string();
+                    self.selected = 0;
+                    self.chat_scroll = 0;
+                    self.notify("Started a new chat session.".to_string());
+                }
+                Ok(other) => {
+                    self.notify(format!("New session failed: unexpected response {other:?}"));
+                }
+                Err(error) => self.notify(format!("New session failed: {error}")),
+            },
             ":refresh" => match self.refresh() {
                 Ok(()) => self.notify("Refreshed.".to_string()),
                 Err(error) => self.notify(format!("Refresh failed: {error}")),
             },
             ":help" => self.modal = Some(Modal::Help),
+            ":calendar-login" => {
+                if arg.is_empty() {
+                    self.start_calendar_login();
+                } else {
+                    self.notify("Usage: :calendar-login".to_string());
+                }
+            }
             ":model" => self.set_tab(Tab::Models),
             ":search" => {
                 if arg.is_empty() {
@@ -1096,17 +1360,133 @@ impl App {
                 if arg.is_empty() {
                     self.notify("Usage: :file <path>".to_string());
                 } else {
-                    self.attachment = Some(PathBuf::from(arg));
-                    self.notify(format!(
-                        "Staged file: {}. Attachment transport will be wired in the protocol pass.",
-                        arg
-                    ));
+                    let path = PathBuf::from(arg);
+                    match std::fs::metadata(&path) {
+                        Ok(metadata) if metadata.is_file() => {
+                            self.attachment = Some(path.clone());
+                            self.notify(format!(
+                                "Staged file: {}. It will be sent with the next chat message.",
+                                path.display()
+                            ));
+                        }
+                        Ok(_) => self.notify("Attachment path is not a regular file.".to_string()),
+                        Err(error) => self.notify(format!("Could not stage attachment: {error}")),
+                    }
                 }
             }
             _ => self.notify(format!("Unknown command {command}. Press ? for help.")),
         }
         self.chat_input.clear();
         self.chat_cursor = 0;
+    }
+
+    fn poll_approvals(&mut self) {
+        if self.pending_chat.is_none() {
+            self.pending_approval_poll = None;
+            return;
+        }
+
+        if let Some(pending) = self.pending_approval_poll.take() {
+            match pending.receiver.try_recv() {
+                Ok(Ok(approvals)) => {
+                    let previous_approval = match self.modal {
+                        Some(Modal::Approval(id)) => Some(id),
+                        _ => None,
+                    };
+                    self.approvals = approvals;
+                    let still_pending = previous_approval
+                        .is_some_and(|id| self.approvals.iter().any(|approval| approval.id == id));
+                    if still_pending || self.pending_approval_response.is_some() {
+                        return;
+                    }
+                    if let Some(approval) = self.approvals.first() {
+                        self.modal = Some(Modal::Approval(approval.id));
+                        self.modal_scroll = 0;
+                        self.notify(format!("Approval required for {}.", approval.tool));
+                    } else if matches!(self.modal, Some(Modal::Approval(_))) {
+                        self.modal = None;
+                    }
+                }
+                Ok(Err(_)) | Err(TryRecvError::Disconnected) => {}
+                Err(TryRecvError::Empty) => {
+                    self.pending_approval_poll = Some(pending);
+                    return;
+                }
+            }
+        }
+
+        if self.pending_approval_poll.is_some()
+            || self.last_approval_poll.elapsed() < APPROVAL_POLL_INTERVAL
+        {
+            return;
+        }
+
+        self.last_approval_poll = Instant::now();
+        let socket_path = self.socket_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let client = IpcClient::new(socket_path).with_timeout(Duration::from_millis(700));
+            let result = match client.request(RequestMethod::ApprovalsList) {
+                Ok(ResponsePayload::Approvals(list)) => Ok(list.approvals),
+                Ok(other) => Err(format!("Unexpected approvals response: {other:?}")),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = sender.send(result);
+        });
+        self.pending_approval_poll = Some(PendingApprovalPoll { receiver });
+    }
+
+    fn poll_approval_response(&mut self) {
+        let Some(pending) = self.pending_approval_response.take() else {
+            return;
+        };
+        match pending.receiver.try_recv() {
+            Ok(Ok(status)) => {
+                self.approvals.retain(|approval| approval.id != status.id);
+                self.modal = None;
+                self.modal_scroll = 0;
+                self.notify(format!(
+                    "{} approval request {}.",
+                    if status.approved {
+                        "Approved"
+                    } else {
+                        "Denied"
+                    },
+                    status.id
+                ));
+            }
+            Ok(Err(error)) => {
+                self.notify(format!("Approval response failed: {error}"));
+            }
+            Err(TryRecvError::Empty) => {
+                self.pending_approval_response = Some(pending);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.notify("Approval response worker disconnected.".to_string());
+            }
+        }
+    }
+
+    fn respond_to_approval(&mut self, approval_id: u64, approved: bool) {
+        if self.pending_approval_response.is_some() {
+            return;
+        }
+
+        let socket_path = self.socket_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let client = IpcClient::new(socket_path).with_timeout(Duration::from_secs(2));
+            let result = match client.request(RequestMethod::ApprovalRespond {
+                id: approval_id,
+                approved,
+            }) {
+                Ok(ResponsePayload::Approval(status)) => Ok(status),
+                Ok(other) => Err(format!("Unexpected approval response: {other:?}")),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = sender.send(result);
+        });
+        self.pending_approval_response = Some(PendingApprovalResponse { receiver });
     }
 
     fn poll_chat_response(&mut self) {
@@ -1120,6 +1500,12 @@ impl App {
                     exchange.assistant = Some(response);
                 }
                 self.pending_chat = None;
+                self.pending_approval_poll = None;
+                self.pending_approval_response = None;
+                if matches!(self.modal, Some(Modal::Approval(_))) {
+                    self.modal = None;
+                }
+                self.approvals.clear();
                 self.chat_scroll = u16::MAX;
                 self.message.clear();
             }
@@ -1129,6 +1515,12 @@ impl App {
                     exchange.assistant = Some(format!("[Error] {error}"));
                 }
                 self.pending_chat = None;
+                self.pending_approval_poll = None;
+                self.pending_approval_response = None;
+                if matches!(self.modal, Some(Modal::Approval(_))) {
+                    self.modal = None;
+                }
+                self.approvals.clear();
                 self.notify(error);
             }
             Err(TryRecvError::Empty) => {}
@@ -1138,6 +1530,12 @@ impl App {
                     exchange.assistant = Some("[Error] Chat worker disconnected.".to_string());
                 }
                 self.pending_chat = None;
+                self.pending_approval_poll = None;
+                self.pending_approval_response = None;
+                if matches!(self.modal, Some(Modal::Approval(_))) {
+                    self.modal = None;
+                }
+                self.approvals.clear();
                 self.notify("Chat worker disconnected.".to_string());
             }
         }
@@ -1162,12 +1560,29 @@ impl App {
                 self.health = Some(health.clone());
                 if health.ready && was_disconnected {
                     self.runtime_reconnect_offered = false;
+                    if let Err(error) = self.load_session_history() {
+                        self.notify(format!("Session history refresh failed: {error}"));
+                    }
                 }
                 if health.ready {
                     if let Ok(ResponsePayload::ModelStatus(status)) =
                         client.request(RequestMethod::ModelStatus)
                     {
                         self.model_status = Some(status);
+                    }
+                    if let Ok(ResponsePayload::SystemInfo(info)) =
+                        client.request(RequestMethod::SystemInfo {
+                            scope: Some("all".to_string()),
+                        })
+                    {
+                        self.system_info = Some(info);
+                    }
+                    if self.tab == Tab::Calendar {
+                        if let Ok((status, events)) = self.request_calendar_snapshot() {
+                            self.calendar_status = Some(status);
+                            self.calendar_events = events;
+                            self.normalize_selection();
+                        }
                     }
                 }
             }
@@ -1396,6 +1811,22 @@ impl App {
                 } else {
                     Some(due)
                 };
+                let calendar_sync = form
+                    .values
+                    .get(3)
+                    .map(|value| value.trim().to_ascii_lowercase())
+                    .and_then(|value| match value.as_str() {
+                        "yes" | "true" | "on" => Some(true),
+                        "no" | "false" | "off" => Some(false),
+                        _ => None,
+                    });
+                let Some(calendar_sync) = calendar_sync else {
+                    if let Some(active) = self.form.as_mut() {
+                        active.validation_error =
+                            Some("Calendar Sync must be yes or no.".to_string());
+                    }
+                    return;
+                };
                 let editing_id = form.editing_id.clone();
                 let was_editing = editing_id.is_some();
                 let mutation = if let Some(id) = editing_id.clone() {
@@ -1405,6 +1836,7 @@ impl App {
                         title: Some(title),
                         body: Some(body),
                         due: Some(due),
+                        calendar_sync: Some(calendar_sync),
                     }
                 } else {
                     RequestMethod::RemindersMutate {
@@ -1413,10 +1845,19 @@ impl App {
                         title: Some(title),
                         body: Some(body),
                         due: Some(due),
+                        calendar_sync: Some(calendar_sync),
                     }
                 };
 
-                match self.client.request(mutation) {
+                let mutation_result = if calendar_sync {
+                    IpcClient::new(&self.socket_path)
+                        .with_timeout(REMINDER_MUTATION_TIMEOUT)
+                        .request(mutation)
+                } else {
+                    self.client.request(mutation)
+                };
+
+                match mutation_result {
                     Ok(ResponsePayload::Mutation(result)) => {
                         let backend_id = result
                             .output
@@ -1434,11 +1875,34 @@ impl App {
                                         .unwrap_or(0);
                                 }
                                 self.form = None;
-                                self.notify(if was_editing {
-                                    "Reminder updated in backend.".to_string()
+                                let base = if was_editing {
+                                    "Reminder updated in backend."
                                 } else {
-                                    "Reminder created in backend.".to_string()
-                                });
+                                    "Reminder created in backend."
+                                };
+                                let sync_message = result
+                                    .output
+                                    .get("calendar_sync_status")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(|status| match status {
+                                        "synced" => " Google Calendar: synced.".to_string(),
+                                        "preserved" => {
+                                            " Google Calendar event preserved.".to_string()
+                                        }
+                                        "disabled" => " Google Calendar sync disabled.".to_string(),
+                                        "skipped" => " Google Calendar: skipped.".to_string(),
+                                        "error" => {
+                                            let error = result
+                                                .output
+                                                .get("calendar_sync_error")
+                                                .and_then(serde_json::Value::as_str)
+                                                .unwrap_or("unknown error");
+                                            format!(" Google Calendar sync failed: {error}")
+                                        }
+                                        other => format!(" Google Calendar: {other}."),
+                                    })
+                                    .unwrap_or_default();
+                                self.notify(format!("{base}{sync_message}"));
                             }
                             Err(error) => {
                                 if let Some(active) = self.form.as_mut() {
@@ -1602,6 +2066,7 @@ impl App {
                     title: None,
                     body: None,
                     due: None,
+                    calendar_sync: None,
                 }) {
                     Ok(ResponsePayload::Mutation(_)) => match self.refresh() {
                         Ok(()) => {
@@ -1764,6 +2229,10 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            if let Some(Modal::Approval(approval_id)) = self.modal {
+                self.respond_to_approval(approval_id, false);
+                return Ok(true);
+            }
             if self.modal.is_some() {
                 self.modal = None;
                 return Ok(true);
@@ -1820,7 +2289,7 @@ impl App {
                 self.next_tab();
                 Ok(true)
             }
-            KeyCode::Char(c) if ('1'..='8').contains(&c) => {
+            KeyCode::Char(c) if ('1'..='9').contains(&c) => {
                 self.set_tab(Tab::from_index(c as usize - '1' as usize));
                 Ok(true)
             }
@@ -1956,6 +2425,19 @@ impl App {
                 KeyCode::Enter => self.execute_confirmed(action),
                 _ => {}
             },
+            Modal::Approval(approval_id) => match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.respond_to_approval(approval_id, true);
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.respond_to_approval(approval_id, false);
+                }
+                KeyCode::Up => self.modal_scroll = self.modal_scroll.saturating_sub(1),
+                KeyCode::Down => self.modal_scroll = self.modal_scroll.saturating_add(1),
+                KeyCode::PageUp => self.modal_scroll = self.modal_scroll.saturating_sub(8),
+                KeyCode::PageDown => self.modal_scroll = self.modal_scroll.saturating_add(8),
+                _ => {}
+            },
             Modal::RuntimeReconnect => match key.code {
                 KeyCode::Esc => self.modal = None,
                 KeyCode::Enter => self.modal = Some(Modal::Confirm(ConfirmAction::RelaunchRuntime)),
@@ -2015,6 +2497,14 @@ impl App {
                 KeyCode::PageDown => self.modal_scroll = self.modal_scroll.saturating_add(8),
                 _ => {}
             },
+            Modal::CalendarDetail => match key.code {
+                KeyCode::Esc | KeyCode::Enter => self.modal = None,
+                KeyCode::Up => self.modal_scroll = self.modal_scroll.saturating_sub(1),
+                KeyCode::Down => self.modal_scroll = self.modal_scroll.saturating_add(1),
+                KeyCode::PageUp => self.modal_scroll = self.modal_scroll.saturating_sub(8),
+                KeyCode::PageDown => self.modal_scroll = self.modal_scroll.saturating_add(8),
+                _ => {}
+            },
         }
         Ok(true)
     }
@@ -2066,6 +2556,9 @@ impl App {
             }
             Tab::Proposals if self.selected_proposal().is_some() => Some(Modal::ProposalDetail),
             Tab::Search if self.selected_search().is_some() => Some(Modal::SearchDetail),
+            Tab::Calendar if self.selected_calendar_event().is_some() => {
+                Some(Modal::CalendarDetail)
+            }
             _ => None,
         };
         self.modal_scroll = 0;
@@ -2182,7 +2675,7 @@ impl App {
                 .checked_sub(1)
                 .filter(|index| *index < self.overview_rows().len()),
             Tab::Models => {
-                let available = self.available_model_count();
+                let available = self.models.len();
                 let per_model =
                     if LayoutMode::for_area(self.last_layout.content) == LayoutMode::Mini {
                         1
@@ -2192,7 +2685,8 @@ impl App {
                 let index = row / per_model;
                 (index < available).then_some(index)
             }
-            Tab::Proposals | Tab::Search => (row < self.current_len()).then_some(row),
+            Tab::Proposals | Tab::Calendar => (row < self.current_len()).then_some(row),
+            Tab::Search => search_visual_to_result_index(&self.search_results, row),
             Tab::Chat => None,
         }
     }
@@ -2215,6 +2709,13 @@ impl App {
             return;
         }
 
+        let outer = Block::default()
+            .borders(Borders::ALL)
+            .border_style(outer_border_style())
+            .style(Style::default().bg(app_background()));
+        let inner_area = outer.inner(area);
+        frame.render_widget(outer, area);
+
         let header_height = match mode {
             LayoutMode::Full => 4,
             LayoutMode::Compact => 4,
@@ -2229,9 +2730,9 @@ impl App {
                 Constraint::Min(1),
                 Constraint::Length(footer_height),
             ])
-            .split(area);
+            .split(inner_area);
 
-        let mut rects = UiRects {
+        let rects = UiRects {
             header: vertical[0],
             content: vertical[1],
             footer: vertical[2],
@@ -2243,24 +2744,62 @@ impl App {
         self.draw_header(frame, vertical[0], mode);
         self.draw_view(frame, vertical[1], mode);
         self.draw_footer(frame, vertical[2], mode);
-        rects = self.last_layout;
-        self.last_layout = rects;
         self.draw_modal(frame, mode);
     }
 
-    fn draw_too_small(&self, frame: &mut Frame, area: Rect) {
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(Span::styled(
-                    "Zaraki",
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-                Line::from("Terminal too small for Zaraki."),
-                Line::from("Resize the terminal to continue."),
-            ])
-            .block(panel_block("Zaraki")),
-            area,
-        );
+    fn draw_too_small(&mut self, frame: &mut Frame, area: Rect) {
+        let outer = Block::default()
+            .borders(Borders::ALL)
+            .border_style(outer_border_style())
+            .style(Style::default().bg(app_background()));
+        let inner = outer.inner(area);
+        frame.render_widget(outer, area);
+
+        let tab = format!("{}:{}", self.tab.index() + 1, TABS[self.tab.index()]);
+        let item = match self.tab {
+            Tab::Tasks => self
+                .tasks
+                .get(self.selected)
+                .map(|task| compact(&task.title, inner.width.saturating_sub(2) as usize)),
+            Tab::Reminders => self
+                .reminders
+                .get(self.selected)
+                .map(|reminder| compact(&reminder.title, inner.width.saturating_sub(2) as usize)),
+            Tab::Overview => self
+                .overview_rows()
+                .get(self.selected)
+                .map(|row| match row {
+                    RowKind::Task(index) => self.tasks[*index].title.clone(),
+                    RowKind::Reminder(index) => self.reminders[*index].title.clone(),
+                })
+                .map(|value| compact(&value, inner.width.saturating_sub(2) as usize)),
+            _ => None,
+        };
+        let mut lines = vec![Line::from(vec![
+            Span::styled("Zaraki", app_title_style()),
+            Span::raw("  "),
+            Span::styled(tab, panel_title_style()),
+        ])];
+        if let Some(item) = item {
+            lines.push(Line::from(format!("> {item}")));
+        } else if matches!(self.tab, Tab::Chat) {
+            lines.push(Line::from("c input"));
+        } else {
+            lines.push(Line::from(Span::styled("No selection.", muted_style())));
+        }
+        lines.push(Line::from(Span::styled(
+            "1-9 views | j/k move | Enter detail | Esc quit",
+            muted_style(),
+        )));
+        frame.render_widget(Paragraph::new(lines), inner);
+        self.last_layout = UiRects {
+            header: Rect::default(),
+            content: inner,
+            footer: Rect::default(),
+            list: inner,
+            input: Rect::default(),
+            modal: Rect::default(),
+        };
     }
 
     fn draw_header(&mut self, frame: &mut Frame, area: Rect, mode: LayoutMode) {
@@ -2272,7 +2811,7 @@ impl App {
             .unwrap_or(false)
         {
             Style::default()
-                .fg(Color::Green)
+                .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
@@ -2290,12 +2829,7 @@ impl App {
             "⚠ runtime disconnected"
         };
         lines.push(Line::from(vec![
-            Span::styled(
-                "Zaraki",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("Zaraki", app_title_style()),
             Span::raw("  "),
             Span::styled(runtime_text, runtime_style),
         ]));
@@ -2325,6 +2859,7 @@ impl App {
             Tab::Models => self.draw_models(frame, area, mode),
             Tab::Jobs => self.draw_jobs(frame, area, mode),
             Tab::Search => self.draw_search(frame, area, mode),
+            Tab::Calendar => self.draw_calendar(frame, area, mode),
         }
     }
 
@@ -2396,32 +2931,42 @@ impl App {
             .split(area);
 
         let mut focus_lines = Vec::new();
-        let focus_tasks = self
-            .tasks
-            .iter()
-            .filter(|task| matches!(task.status.as_str(), "in_progress" | "open"))
-            .take(2);
-        for task in focus_tasks {
-            focus_lines.push(Line::from(format!(
-                "{} {}",
-                task_symbol(&task.status),
-                compact(&task.title, inner_width(sections[0]).saturating_sub(4))
-            )));
+        let today = OffsetDateTime::now_local()
+            .unwrap_or_else(|_| OffsetDateTime::now_utc())
+            .date();
+        for index in self
+            .important_task_indices()
+            .into_iter()
+            .filter(|index| task_is_due_today(&self.tasks[*index], today))
+            .take(2)
+        {
+            let task = &self.tasks[index];
+            focus_lines.push(Line::from(vec![
+                Span::raw(format!("{} ", task_symbol(&task.status))),
+                Span::styled(
+                    compact(&task.title, inner_width(sections[0]).saturating_sub(4)),
+                    task_priority_style(&task.priority),
+                ),
+            ]));
         }
-        for reminder in self
-            .reminders
-            .iter()
-            .filter(|reminder| matches!(reminder.status.as_str(), "triggered" | "scheduled"))
+        for index in self
+            .important_reminder_indices()
+            .into_iter()
+            .filter(|index| reminder_is_due_today(&self.reminders[*index], today))
             .take(1)
         {
-            focus_lines.push(Line::from(format!(
-                "◷ {}",
-                compact(&reminder.title, inner_width(sections[0]).saturating_sub(4))
-            )));
+            let reminder = &self.reminders[index];
+            focus_lines.push(Line::from(vec![
+                Span::styled("◷ ", calendar_sync_style(reminder.calendar_sync_enabled)),
+                Span::raw(compact(
+                    &reminder.title,
+                    inner_width(sections[0]).saturating_sub(4),
+                )),
+            ]));
         }
         if focus_lines.is_empty() {
             focus_lines.push(Line::from(Span::styled(
-                "□  No active focus items.",
+                "Nothing scheduled for today.",
                 muted_style(),
             )));
         }
@@ -2440,7 +2985,12 @@ impl App {
         );
 
         let mut lines = Vec::new();
-        let max_items = if mode == LayoutMode::Mini { 5 } else { 10 };
+        let max_items = match mode {
+            LayoutMode::Full => 14,
+            LayoutMode::Compact => 8,
+            LayoutMode::Mini => 4,
+            LayoutMode::TooSmall => 2,
+        };
         let overview_rows = self.overview_rows();
         for (row_index, row) in overview_rows.iter().take(max_items).enumerate() {
             let selected = row_index == self.selected;
@@ -2478,11 +3028,17 @@ impl App {
             sections[1],
         );
 
+        let review_line = if self.proposals.is_empty() {
+            "No memory proposals pending review.".to_string()
+        } else {
+            format!("{} memory proposal(s) pending review", self.proposals.len())
+        };
         frame.render_widget(
-            Paragraph::new(vec![Line::from(format!(
-                "{} proposal(s) pending review",
-                self.proposals.len()
-            ))])
+            Paragraph::new(Line::from(if self.proposals.is_empty() {
+                Span::styled(review_line, muted_style())
+            } else {
+                Span::raw(review_line)
+            }))
             .block(panel_block("Memory"))
             .wrap(Wrap { trim: true }),
             sections[2],
@@ -2555,7 +3111,9 @@ impl App {
 
         let mut state = ListState::default();
         state.select(selected_item);
-        let list = List::new(items).highlight_style(selected_row_style());
+        let list = List::new(items)
+            .highlight_style(selected_row_style())
+            .highlight_symbol("> ");
         frame.render_stateful_widget(list, list_area, &mut state);
         self.list_scroll = state.offset();
         render_vertical_scrollbar(
@@ -2613,7 +3171,9 @@ impl App {
         let mut state = ListState::default();
         state.select(selected_item);
         frame.render_stateful_widget(
-            List::new(items).highlight_style(selected_row_style()),
+            List::new(items)
+                .highlight_style(selected_row_style())
+                .highlight_symbol("> "),
             list_area,
             &mut state,
         );
@@ -2663,7 +3223,9 @@ impl App {
         let mut state = ListState::default();
         state.select(Some(self.selected.min(items.len().saturating_sub(1))));
         frame.render_stateful_widget(
-            List::new(items).highlight_style(selected_row_style()),
+            List::new(items)
+                .highlight_style(selected_row_style())
+                .highlight_symbol("> "),
             list_area,
             &mut state,
         );
@@ -2780,12 +3342,7 @@ impl App {
         }
         let mut lines = Vec::new();
         for exchange in &self.chat {
-            lines.push(Line::from(Span::styled(
-                "You",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )));
+            lines.push(Line::from(Span::styled("You", section_style())));
             lines.extend(render_plain_text(
                 &exchange.user,
                 width,
@@ -2793,12 +3350,7 @@ impl App {
                 Style::default(),
             ));
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "Zaraki",
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            )));
+            lines.push(Line::from(Span::styled("Zaraki", app_title_style())));
             match &exchange.assistant {
                 Some(text) => lines.extend(render_terminal_markdown(text, "  ", width)),
                 None => lines.push(Line::from(Span::styled(
@@ -2812,7 +3364,7 @@ impl App {
     }
 
     fn draw_models(&mut self, frame: &mut Frame, area: Rect, mode: LayoutMode) {
-        let block = Block::default().borders(Borders::ALL).title("Models");
+        let block = panel_block("Models");
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let diagnostics_height =
@@ -2821,44 +3373,43 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(4), Constraint::Length(diagnostics_height)])
             .split(inner);
-        let available = self
+        let items = self
             .models
-            .iter()
-            .filter(|model| model.available)
-            .collect::<Vec<_>>();
-        let items = available
             .iter()
             .map(|model| {
                 let marker = if model.active { "◆" } else { "◇" };
                 let style = model_state_style(model.active, model.available);
                 let name_width = sections[0].width.saturating_sub(18) as usize;
-                let mut first_line = vec![
+                let first_line = vec![
                     Span::styled(format!("{marker} "), style),
                     Span::styled(
                         compact(&model.display_name, name_width.max(8)),
                         style.add_modifier(Modifier::BOLD),
                     ),
                 ];
-                if mode != LayoutMode::Mini {
-                    first_line.push(Span::styled(
-                        format!(" [{}]", compact(&model.location, 12)),
-                        style,
-                    ));
-                }
                 let mut lines = vec![Line::from(first_line)];
                 if mode == LayoutMode::Full {
+                    let availability = if model.available {
+                        "available"
+                    } else {
+                        "unavailable"
+                    };
                     lines.push(Line::from(vec![
                         Span::styled("   ", muted_style()),
-                        Span::styled(compact(&model.id, 28), muted_style()),
-                        Span::styled(
-                            format!("  caps: {}", compact(&model.capabilities.join(", "), 42)),
-                            muted_style(),
-                        ),
+                        Span::styled(compact(&model.id, 24), muted_style()),
+                        Span::styled(format!("  {availability}"), style),
                     ]));
                 } else if mode == LayoutMode::Compact {
                     lines.push(Line::from(vec![
                         Span::styled("   ", muted_style()),
-                        Span::styled(compact(&model.id, 20), muted_style()),
+                        Span::styled(
+                            if model.available {
+                                "available"
+                            } else {
+                                "unavailable"
+                            },
+                            style,
+                        ),
                     ]));
                 }
                 ListItem::new(lines)
@@ -2873,9 +3424,12 @@ impl App {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title("Available models"),
+                        .border_style(panel_border_style())
+                        .title("Available models")
+                        .title_style(panel_title_style()),
                 )
-                .highlight_style(selected_row_style()),
+                .highlight_style(selected_row_style())
+                .highlight_symbol("> "),
             sections[0],
             &mut list_state,
         );
@@ -2885,75 +3439,147 @@ impl App {
             frame,
             sections[0],
             list_state.offset(),
-            available.len(),
+            self.models.len(),
             sections[0].height.saturating_sub(2) as usize / model_item_height,
             true,
         );
-        let active_model = available.iter().find(|model| model.active);
-        let diagnostics = if mode == LayoutMode::Mini {
-            vec![
-                Line::from(Span::styled("Runtime", section_style())),
-                Line::from(format!(
-                    "Active: {}",
-                    active_model
-                        .map(|model| compact(&model.display_name, 28))
-                        .unwrap_or_else(|| "none".to_string())
-                )),
-                Line::from(format!(
-                    "Ready: {}",
-                    self.model_status
-                        .as_ref()
-                        .map(|status| status.ready)
-                        .unwrap_or(false)
-                )),
-            ]
-        } else {
-            vec![
-                Line::from(Span::styled("Runtime diagnostics", section_style())),
-                Line::from(format!(
-                    "Active: {}",
-                    active_model
-                        .map(|model| model.display_name.as_str())
-                        .unwrap_or("none")
-                )),
-                Line::from(format!(
-                    "Ready: {}",
-                    self.model_status
-                        .as_ref()
-                        .map(|status| status.ready)
-                        .unwrap_or(false)
-                )),
-                Line::from(format!(
-                    "Endpoint: {}",
-                    active_model
-                        .map(|model| model.endpoint.as_str())
-                        .unwrap_or("n/a")
-                )),
-                Line::from(format!(
-                    "Context: {}   VRAM: {}",
-                    active_model
-                        .map(|model| model.context.as_str())
-                        .unwrap_or("n/a"),
-                    active_model
-                        .map(|model| model.vram.as_str())
-                        .unwrap_or("n/a")
-                )),
-                Line::from(format!(
-                    "PID: {}   Generation: {}",
-                    active_model
-                        .map(|model| model.pid.as_str())
-                        .unwrap_or("n/a"),
-                    active_model
-                        .map(|model| model.speed.as_str())
-                        .unwrap_or("n/a")
-                )),
-            ]
-        };
+        let active_model = self
+            .models
+            .iter()
+            .find(|model| model.active && model.available);
+        let diagnostics = system_diagnostics_lines(
+            self.system_info.as_ref(),
+            active_model.map(|model| model.display_name.as_str()),
+            self.model_status.as_ref().map(|status| status.ready),
+            mode,
+        );
         frame.render_widget(
             Paragraph::new(diagnostics).block(panel_block("Diagnostics")),
             sections[1],
         );
         self.last_layout.list = sections[0];
+    }
+
+    fn draw_calendar(&mut self, frame: &mut Frame, area: Rect, mode: LayoutMode) {
+        let block = panel_block("Calendar");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let status = self.calendar_status.as_ref();
+        let status_line = match status {
+            Some(value) if value.authenticated => format!(
+                "● Connected  | {} event(s) this month",
+                self.calendar_events.len()
+            ),
+            Some(value) if value.configured => {
+                "○ Not authenticated  | use :calendar-login".to_string()
+            }
+            Some(_) => "○ Google Calendar is not configured  | :calendar-login after OAuth setup"
+                .to_string(),
+            None => "? Calendar status unavailable".to_string(),
+        };
+        frame.render_widget(
+            Paragraph::new(status_line).style(if status.is_some_and(|value| value.authenticated) {
+                Style::default().fg(Color::Yellow)
+            } else {
+                muted_style()
+            }),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+
+        let month_height = match mode {
+            LayoutMode::Full => 9,
+            LayoutMode::Compact => 9,
+            LayoutMode::Mini => 9,
+            LayoutMode::TooSmall => 5,
+        };
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(month_height.min(inner.height.saturating_sub(2))),
+                Constraint::Min(2),
+            ])
+            .split(Rect::new(
+                inner.x,
+                inner.y.saturating_add(1),
+                inner.width,
+                inner.height.saturating_sub(1),
+            ));
+
+        let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+        let month_lines = calendar_month_lines(
+            now.date(),
+            &self.calendar_events,
+            sections[0].width as usize,
+            mode,
+        );
+        let month_title = format!("{} {}", month_name(now.month()), now.year());
+        frame.render_widget(
+            Paragraph::new(month_lines).block(panel_block(&month_title)),
+            sections[0],
+        );
+
+        let list_area = sections[1];
+        if self.calendar_events.is_empty() {
+            let message = match status {
+                Some(value) if value.authenticated => "No events in the current month.",
+                Some(value) if value.configured => {
+                    "Google Calendar is not authenticated. Use :calendar-login."
+                }
+                _ => "Google Calendar is unavailable.",
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(message, muted_style())).block(panel_block("Upcoming")),
+                list_area,
+            );
+            self.last_layout.list = list_area;
+            return;
+        }
+
+        let items = self
+            .calendar_events
+            .iter()
+            .map(|event| {
+                let title_width = if mode == LayoutMode::Full { 46 } else { 30 };
+                let marker_style = if event.status == "cancelled" {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled("◷ ", marker_style),
+                    Span::styled(compact(&event.start, 18), muted_style()),
+                    Span::raw("  "),
+                    Span::styled(
+                        compact(
+                            &event.summary,
+                            title_width.min(list_area.width.saturating_sub(26) as usize),
+                        ),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let mut state = ListState::default();
+        state.select(Some(self.selected.min(items.len().saturating_sub(1))));
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(panel_block("Upcoming"))
+                .highlight_style(selected_row_style())
+                .highlight_symbol("> "),
+            list_area,
+            &mut state,
+        );
+        self.list_scroll = state.offset();
+        render_vertical_scrollbar(
+            frame,
+            list_area,
+            state.offset(),
+            self.calendar_events.len(),
+            list_area.height.saturating_sub(2) as usize,
+            true,
+        );
+        self.last_layout.list = list_area;
     }
 
     fn draw_jobs(&mut self, frame: &mut Frame, area: Rect, mode: LayoutMode) {
@@ -3016,7 +3642,9 @@ impl App {
         let mut state = ListState::default();
         state.select(selected_item);
         frame.render_stateful_widget(
-            List::new(items).highlight_style(selected_row_style()),
+            List::new(items)
+                .highlight_style(selected_row_style())
+                .highlight_symbol("> "),
             inner,
             &mut state,
         );
@@ -3068,64 +3696,84 @@ impl App {
             vertical[0],
         );
         self.last_layout.input = vertical[0];
-        let lines = if self.search_results.is_empty() {
-            vec![Line::from(Span::styled(
-                if self.search_input.is_empty() {
-                    "Press / to search indexed memory."
-                } else {
-                    "No results."
-                },
-                muted_style(),
-            ))]
-        } else {
-            self.search_results
-                .iter()
-                .map(|(id, text, score)| {
-                    let source = id
-                        .split_once(':')
-                        .map(|(source, _)| source)
-                        .unwrap_or("RESULT");
-                    Line::from(vec![
-                        Span::styled(format!("{source:<9} "), section_style()),
-                        Span::raw(format!(
-                            "{:.2}  {}",
-                            score,
-                            compact(text, inner_width(vertical[1]).saturating_sub(18))
-                        )),
-                    ])
-                })
-                .collect()
-        };
-        self.render_selectable_lines(frame, vertical[1], lines, "Results");
-        self.last_layout.list = vertical[1];
-    }
 
-    fn render_selectable_lines(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        lines: Vec<Line<'static>>,
-        title: &str,
-    ) {
-        let items = lines.into_iter().map(ListItem::new).collect::<Vec<_>>();
-        let item_count = items.len();
-        let mut state = ListState::default();
-        if !items.is_empty() {
-            state.select(Some(self.selected.min(items.len().saturating_sub(1))));
+        let mut groups: Vec<(String, Vec<(usize, &(String, String, f64))>)> = Vec::new();
+        for (index, result) in self.search_results.iter().enumerate() {
+            let group = search_group_label(&result.0).to_string();
+            if let Some((_, entries)) = groups.iter_mut().find(|(name, _)| *name == group) {
+                entries.push((index, result));
+            } else {
+                groups.push((group, vec![(index, result)]));
+            }
         }
-        let list = List::new(items)
-            .block(panel_block(title))
-            .highlight_style(selected_row_style());
-        frame.render_stateful_widget(list, area, &mut state);
+        groups.sort_by(|left, right| {
+            let left_score = left
+                .1
+                .first()
+                .map(|(_, result)| result.2)
+                .unwrap_or(f64::NEG_INFINITY);
+            let right_score = right
+                .1
+                .first()
+                .map(|(_, result)| result.2)
+                .unwrap_or(f64::NEG_INFINITY);
+            right_score
+                .partial_cmp(&left_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let group_count = groups.len();
+        let mut items = Vec::<(Option<usize>, ListItem<'static>)>::new();
+        if self.search_results.is_empty() {
+            items.push((
+                None,
+                ListItem::new(Line::from(Span::styled(
+                    if self.search_input.is_empty() {
+                        "Press / to search indexed memory."
+                    } else {
+                        "No results."
+                    },
+                    muted_style(),
+                ))),
+            ));
+        } else {
+            for (group, entries) in groups {
+                items.push((
+                    None,
+                    ListItem::new(Line::from(Span::styled(group, section_style()))),
+                ));
+                for (index, (_id, text, score)) in entries {
+                    items.push((
+                        Some(index),
+                        ListItem::new(Line::from(vec![
+                            Span::styled(format!("{score:.2}  "), muted_style()),
+                            Span::raw(compact(text, inner_width(vertical[1]).saturating_sub(12))),
+                        ])),
+                    ));
+                }
+            }
+        }
+
+        let visual_selected = items
+            .iter()
+            .position(|(index, _)| *index == Some(self.selected));
+        let mut state = ListState::default();
+        state.select(visual_selected);
+        let list = List::new(items.into_iter().map(|(_, item)| item).collect::<Vec<_>>())
+            .block(panel_block("Results"))
+            .highlight_style(selected_row_style())
+            .highlight_symbol("> ");
+        frame.render_stateful_widget(list, vertical[1], &mut state);
         self.list_scroll = state.offset();
         render_vertical_scrollbar(
             frame,
-            area,
+            vertical[1],
             state.offset(),
-            item_count,
-            area.height.saturating_sub(2) as usize,
+            self.search_results.len() + group_count,
+            vertical[1].height.saturating_sub(2) as usize,
             true,
         );
+        self.last_layout.list = vertical[1];
     }
 
     fn draw_modal(&mut self, frame: &mut Frame, mode: LayoutMode) {
@@ -3410,6 +4058,8 @@ fn modal_title(modal: Modal) -> &'static str {
         Modal::ReminderDetail => "Reminder",
         Modal::ProposalDetail => "Memory proposal",
         Modal::SearchDetail => "Search result",
+        Modal::CalendarDetail => "Calendar event",
+        Modal::Approval(_) => "Approval required",
         Modal::RuntimeReconnect => "Runtime disconnected",
     }
 }
@@ -3417,7 +4067,7 @@ fn modal_title(modal: Modal) -> &'static str {
 fn modal_lines(app: &App, modal: Modal, width: usize) -> Vec<Line<'static>> {
     match modal {
         Modal::Help => vec![
-            "1-8     switch views".into(),
+            "1-9     switch views".into(),
             "h/l     previous / next view".into(),
             "j/k     move selection".into(),
             "Enter   open detail / switch model".into(),
@@ -3428,6 +4078,7 @@ fn modal_lines(app: &App, modal: Modal, width: usize) -> Vec<Line<'static>> {
             "a       accept memory proposal".into(),
             "/       search".into(),
             "r       refresh runtime state".into(),
+            ":calendar-login  link Google Calendar".into(),
             "?       this help".into(),
             "Esc     back / close / quit".into(),
             "Ctrl+C  same layered exit behavior".into(),
@@ -3450,6 +4101,25 @@ fn modal_lines(app: &App, modal: Modal, width: usize) -> Vec<Line<'static>> {
                 Line::from(""),
                 Line::from("Enter confirm   Esc cancel"),
             ]
+        }
+        Modal::Approval(approval_id) => {
+            let Some(approval) = app
+                .approvals
+                .iter()
+                .find(|approval| approval.id == approval_id)
+            else {
+                return vec![
+                    Line::from("This approval request is no longer pending."),
+                    Line::from(""),
+                    Line::from(Span::styled("Esc close", muted_style())),
+                ];
+            };
+
+            let arguments = serde_json::to_string_pretty(&approval.arguments)
+                .unwrap_or_else(|_| approval.arguments.to_string());
+            let mut lines = vec![format!("Tool: {}", approval.tool), "Arguments:".to_string()];
+            lines.extend(arguments.lines().map(str::to_string));
+            detail_lines(lines, width, "Enter/Y approve | N/Esc deny")
         }
         Modal::RuntimeReconnect => vec![
             Line::from("The Assistant runtime is disconnected."),
@@ -3501,6 +4171,7 @@ fn modal_lines(app: &App, modal: Modal, width: usize) -> Vec<Line<'static>> {
                                     .map(format_due)
                                     .unwrap_or_else(|| "No due date".to_string())
                             ),
+                            format!("Google Calendar Sync: {}", reminder.calendar_sync_enabled),
                             format!("Created: {}", reminder.created_at),
                             format!("Updated: {}", reminder.updated_at),
                         ],
@@ -3510,6 +4181,34 @@ fn modal_lines(app: &App, modal: Modal, width: usize) -> Vec<Line<'static>> {
                 }
             }
             vec![Line::from("No reminder selected.")]
+        }
+        Modal::CalendarDetail => {
+            if let Some(event) = app.selected_calendar_event() {
+                let location = if event.location.is_empty() {
+                    "None"
+                } else {
+                    event.location.as_str()
+                };
+                let link = if event.html_link.is_empty() {
+                    "None"
+                } else {
+                    event.html_link.as_str()
+                };
+                return detail_lines(
+                    vec![
+                        format!("Title: {}", event.summary),
+                        format!("Status: {}", event.status),
+                        format!("Start: {}", event.start),
+                        format!("End: {}", event.end),
+                        format!("Location: {location}"),
+                        format!("Event ID: {}", event.id),
+                        format!("Google link: {link}"),
+                    ],
+                    width,
+                    "Enter/Esc close",
+                );
+            }
+            vec![Line::from("No calendar event selected.")]
         }
         Modal::ProposalDetail => {
             if let Some(proposal) = app.selected_proposal() {
@@ -3662,6 +4361,14 @@ fn detail_lines(lines: Vec<String>, width: usize, footer: &str) -> Vec<Line<'sta
     output
 }
 
+fn app_background() -> Color {
+    Color::Rgb(40, 44, 52)
+}
+
+fn outer_border_style() -> Style {
+    Style::default().fg(Color::Cyan)
+}
+
 fn panel_border_style() -> Style {
     Style::default().fg(Color::DarkGray)
 }
@@ -3672,9 +4379,15 @@ fn panel_title_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+fn app_title_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
+
 fn section_style() -> Style {
     Style::default()
-        .fg(Color::Gray)
+        .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -3683,13 +4396,32 @@ fn muted_style() -> Style {
 }
 
 fn selected_row_style() -> Style {
-    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    Style::default().add_modifier(Modifier::BOLD)
 }
 
 fn active_tab_style() -> Style {
     Style::default()
         .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn task_priority_style(priority: &str) -> Style {
+    match priority {
+        "high" => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        "medium" => Style::default(),
+        "low" => muted_style(),
+        _ => muted_style(),
+    }
+}
+
+fn calendar_sync_style(enabled: bool) -> Style {
+    if enabled {
+        Style::default().fg(Color::Cyan)
+    } else {
+        muted_style()
+    }
 }
 
 fn panel_block(title: &str) -> Block<'_> {
@@ -3735,6 +4467,7 @@ fn footer_commands(
         Tab::Models => "↑↓ select | Enter switch | r refresh".to_string(),
         Tab::Jobs => "j/k select | r refresh".to_string(),
         Tab::Search => "/ search | Enter detail | r refresh".to_string(),
+        Tab::Calendar => "Enter detail | r refresh | :calendar-login".to_string(),
     }
 }
 
@@ -3840,18 +4573,27 @@ fn task_header_line(width: usize, mode: LayoutMode) -> Line<'static> {
 
 fn task_line(task: &UiTask, width: usize, mode: LayoutMode) -> Line<'static> {
     let checkbox = task_symbol(&task.status);
+    let checkbox_style = if matches!(task.status.as_str(), "completed" | "cancelled" | "archived") {
+        muted_style()
+    } else {
+        Style::default()
+    };
     if mode == LayoutMode::Mini {
         let due_width = 11;
         let title_width = width.saturating_sub(due_width + 5).max(8).min(28);
         let due = compact(task.due_at.as_deref().unwrap_or("--"), due_width);
         let title = compact(&task.title, title_width);
-        return Line::from(format!(
-            "{:<due_width$}  {:<title_width$}  {checkbox}",
-            due,
-            title,
-            due_width = due_width,
-            title_width = title_width,
-        ));
+        return Line::from(vec![
+            Span::styled(
+                format!("{due:<due_width$}  ", due_width = due_width),
+                task_due_style(task.due_at.as_deref()),
+            ),
+            Span::raw(format!(
+                "{title:<title_width$}  ",
+                title_width = title_width
+            )),
+            Span::styled(checkbox.to_string(), checkbox_style),
+        ]);
     }
 
     let due_width = 16;
@@ -3865,17 +4607,268 @@ fn task_line(task: &UiTask, width: usize, mode: LayoutMode) -> Line<'static> {
     let title = compact(&task.title, title_width);
     let status = compact(&task_status_label(&task.status), status_width);
     let priority = compact(&task_priority_label(&task.priority), priority_width);
-    Line::from(format!(
-        "{:<due_width$}  {:<title_width$}  {:<status_width$} {:<priority_width$}  {checkbox}",
-        due,
-        title,
-        status,
-        priority,
-        due_width = due_width,
-        title_width = title_width,
-        status_width = status_width,
-        priority_width = priority_width,
-    ))
+    Line::from(vec![
+        Span::styled(
+            format!("{due:<due_width$}  ", due_width = due_width),
+            task_due_style(task.due_at.as_deref()),
+        ),
+        Span::raw(format!(
+            "{title:<title_width$}  ",
+            title_width = title_width
+        )),
+        Span::raw(format!(
+            "{status:<status_width$} ",
+            status_width = status_width
+        )),
+        Span::styled(
+            format!(
+                "{priority:<priority_width$}  ",
+                priority_width = priority_width
+            ),
+            task_priority_style(&task.priority),
+        ),
+        Span::styled(checkbox.to_string(), checkbox_style),
+    ])
+}
+
+fn task_due_style(due_at: Option<&str>) -> Style {
+    match due_at.and_then(parse_display_date) {
+        Some(date) if date < local_today() => {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        }
+        Some(date) if date == local_today() => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        _ => Style::default(),
+    }
+}
+
+fn local_today() -> time::Date {
+    OffsetDateTime::now_local()
+        .unwrap_or_else(|_| OffsetDateTime::now_utc())
+        .date()
+}
+
+fn parse_display_date(value: &str) -> Option<time::Date> {
+    let first = value.split_whitespace().next()?;
+    let parts = first.split('-').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return None;
+    }
+    if parts[0].len() == 4 {
+        let year = parts[0].parse::<i32>().ok()?;
+        let month = parts[1].parse::<u8>().ok()?;
+        let day = parts[2].parse::<u8>().ok()?;
+        return time::Date::from_calendar_date(year, time::Month::try_from(month).ok()?, day).ok();
+    }
+    let day = parts[0].parse::<u8>().ok()?;
+    let month = parts[1].parse::<u8>().ok()?;
+    let year = 2000 + parts[2].parse::<i32>().ok()?;
+    time::Date::from_calendar_date(year, time::Month::try_from(month).ok()?, day).ok()
+}
+
+fn task_is_due_today(task: &UiTask, today: time::Date) -> bool {
+    task.due_at.as_deref().and_then(parse_display_date) == Some(today)
+}
+
+fn reminder_is_due_today(reminder: &UiReminder, today: time::Date) -> bool {
+    reminder.due_at.as_deref().and_then(parse_display_date) == Some(today)
+}
+
+fn compare_overview_tasks(left: &UiTask, right: &UiTask, today: time::Date) -> std::cmp::Ordering {
+    fn bucket(task: &UiTask, today: time::Date) -> u8 {
+        match task.due_at.as_deref().and_then(parse_display_date) {
+            Some(date) if date == today => 0,
+            Some(date)
+                if date > today
+                    && date <= today.saturating_add(time::Duration::days(30))
+                    && task.priority == "high" =>
+            {
+                1
+            }
+            Some(date)
+                if date > today && date <= today.saturating_add(time::Duration::days(30)) =>
+            {
+                2
+            }
+            Some(date) if date < today => 3,
+            _ => 4,
+        }
+    }
+    bucket(left, today)
+        .cmp(&bucket(right, today))
+        .then_with(|| left.due_at.as_deref().cmp(&right.due_at.as_deref()))
+        .then_with(|| task_priority_rank(&left.priority).cmp(&task_priority_rank(&right.priority)))
+        .then_with(|| left.title.cmp(&right.title))
+}
+
+fn search_group_label(id: &str) -> &'static str {
+    match id.split_once(':').map(|(source, _)| source).unwrap_or(id) {
+        "project" | "projects" => "Projects",
+        "topic" | "topics" => "Topics",
+        "person" | "people" => "People",
+        "journal" => "Journal",
+        "idea" | "ideas" => "Ideas",
+        "meeting" | "meetings" => "Meetings",
+        "reference" | "references" => "References",
+        "conversation" | "session" => "Conversation",
+        _ => "Other",
+    }
+}
+
+fn search_visual_to_result_index(
+    results: &[(String, String, f64)],
+    visual_row: usize,
+) -> Option<usize> {
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (index, result) in results.iter().enumerate() {
+        let group = search_group_label(&result.0).to_string();
+        if let Some((_, indices)) = groups.iter_mut().find(|(name, _)| *name == group) {
+            indices.push(index);
+        } else {
+            groups.push((group, vec![index]));
+        }
+    }
+    groups.sort_by(|left, right| {
+        let left_score = left
+            .1
+            .first()
+            .map(|index| results[*index].2)
+            .unwrap_or(f64::NEG_INFINITY);
+        let right_score = right
+            .1
+            .first()
+            .map(|index| results[*index].2)
+            .unwrap_or(f64::NEG_INFINITY);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut row = 0usize;
+    for (_, indices) in groups {
+        if row == visual_row {
+            return None;
+        }
+        row += 1;
+        for index in indices {
+            if row == visual_row {
+                return Some(index);
+            }
+            row += 1;
+        }
+    }
+    None
+}
+
+fn calendar_event_day(event: &UiCalendarEvent) -> Option<time::Date> {
+    parse_display_date(&event.start)
+}
+
+fn month_name(month: time::Month) -> &'static str {
+    match month {
+        time::Month::January => "January",
+        time::Month::February => "February",
+        time::Month::March => "March",
+        time::Month::April => "April",
+        time::Month::May => "May",
+        time::Month::June => "June",
+        time::Month::July => "July",
+        time::Month::August => "August",
+        time::Month::September => "September",
+        time::Month::October => "October",
+        time::Month::November => "November",
+        time::Month::December => "December",
+    }
+}
+
+fn days_in_month(year: i32, month: time::Month) -> u8 {
+    match month {
+        time::Month::January
+        | time::Month::March
+        | time::Month::May
+        | time::Month::July
+        | time::Month::August
+        | time::Month::October
+        | time::Month::December => 31,
+        time::Month::April | time::Month::June | time::Month::September | time::Month::November => {
+            30
+        }
+        time::Month::February if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        time::Month::February => 28,
+    }
+}
+
+fn calendar_month_lines(
+    date: time::Date,
+    events: &[UiCalendarEvent],
+    width: usize,
+    mode: LayoutMode,
+) -> Vec<Line<'static>> {
+    let year = date.year();
+    let month = date.month();
+    let days = days_in_month(year, month);
+    let first = time::Date::from_calendar_date(year, month, 1).ok();
+    let first_weekday = first
+        .map(|value| value.weekday().number_from_monday() as usize - 1)
+        .unwrap_or(0);
+    let mut lines = Vec::new();
+
+    let (cell_width, weekdays) = if mode == LayoutMode::Mini || width < 70 {
+        (4usize, ["M", "T", "W", "T", "F", "S", "S"])
+    } else {
+        (9usize, ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+    };
+
+    lines.push(Line::from(
+        weekdays
+            .iter()
+            .map(|day| Span::styled(format!("{day:<cell_width$}"), section_style()))
+            .collect::<Vec<_>>(),
+    ));
+
+    let today = local_today();
+    let mut day = 1u8;
+    let rows = ((first_weekday + days as usize + 6) / 7).max(1);
+    for row in 0..rows {
+        let mut spans = Vec::new();
+        for col in 0..7usize {
+            let slot = row * 7 + col;
+            if slot < first_weekday || day > days {
+                spans.push(Span::raw(" ".repeat(cell_width)));
+                continue;
+            }
+            let current = time::Date::from_calendar_date(year, month, day).ok();
+            let has_event = current.is_some_and(|candidate| {
+                events
+                    .iter()
+                    .any(|event| calendar_event_day(event) == Some(candidate))
+            });
+            let label = if has_event && current == Some(today) {
+                format!("*{:02}", day)
+            } else if has_event {
+                format!("·{:02}", day)
+            } else if current == Some(today) {
+                format!("•{:02}", day)
+            } else {
+                format!(" {:02}", day)
+            };
+            let style = if current == Some(today) {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if has_event {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            spans.push(Span::styled(format!("{label:<cell_width$}"), style));
+            day += 1;
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 fn task_status_group_label(status: &str) -> &'static str {
@@ -4000,17 +4993,28 @@ fn reminder_line(reminder: &UiReminder, width: usize, mode: LayoutMode) -> Line<
         &reminder.title,
         title_limit.min(width.saturating_sub(20).max(8)),
     );
-    Line::from(if mode == LayoutMode::Mini {
-        format!("{symbol} {}  {}", compact(&due, 16), title)
+    let sync = if reminder.calendar_sync_enabled {
+        "↗"
     } else {
-        format!(
-            "{:<15} {:<title_limit$} {:<12} {symbol}",
-            due,
-            title,
-            reminder_status_group_label(&reminder.status),
-            title_limit = title_limit.min(48)
-        )
-    })
+        " "
+    };
+    if mode == LayoutMode::Mini {
+        Line::from(vec![
+            Span::raw(format!("{symbol} {}  {} ", compact(&due, 16), title)),
+            Span::styled(sync, calendar_sync_style(reminder.calendar_sync_enabled)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw(format!(
+                "{:<15} {:<title_limit$} {:<12} {symbol} ",
+                due,
+                title,
+                reminder_status_group_label(&reminder.status),
+                title_limit = title_limit.min(48)
+            )),
+            Span::styled(sync, calendar_sync_style(reminder.calendar_sync_enabled)),
+        ])
+    }
 }
 
 fn task_symbol(status: &str) -> &'static str {
@@ -4124,9 +5128,9 @@ fn model_state_style(active: bool, available: bool) -> Style {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else if available {
-        Style::default().fg(Color::Green)
+        Style::default()
     } else {
-        Style::default().fg(Color::DarkGray)
+        muted_style()
     }
 }
 
@@ -4136,7 +5140,7 @@ fn job_status_style(status: &str) -> Style {
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
         "failed" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        "completed" => Style::default().fg(Color::Green),
+        "completed" => Style::default().fg(Color::Cyan),
         _ => Style::default(),
     }
 }
@@ -4158,12 +5162,6 @@ fn ui_model_from_backend(model: assistant_protocol::ModelInfo) -> UiModel {
         available: model.available,
         active: model.active,
         capabilities: model.capabilities,
-        location: "LOCAL".to_string(),
-        endpoint: "n/a".to_string(),
-        context: "n/a".to_string(),
-        vram: "n/a".to_string(),
-        pid: "n/a".to_string(),
-        speed: "n/a".to_string(),
     }
 }
 
@@ -4210,6 +5208,8 @@ fn ui_reminder_from_backend(reminder: assistant_protocol::ReminderSummary) -> Ui
             .as_deref()
             .and_then(format_backend_timestamp)
             .unwrap_or_default(),
+        calendar_sync_enabled: reminder.calendar_sync_enabled,
+        calendar_sync_status: reminder.calendar_sync_status,
     }
 }
 
@@ -4242,6 +5242,169 @@ fn ui_search_result_from_backend(
     result: assistant_protocol::MemorySummary,
 ) -> (String, String, f64) {
     (result.id, result.text, result.score)
+}
+
+fn ui_calendar_event_from_backend(value: serde_json::Value) -> Option<UiCalendarEvent> {
+    let id = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let summary = value
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Untitled event")
+        .to_string();
+    let status = value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("confirmed")
+        .to_string();
+    let start = calendar_event_time(&value, "start");
+    let end = calendar_event_time(&value, "end");
+    Some(UiCalendarEvent {
+        id,
+        summary,
+        status,
+        start,
+        end,
+        location: value
+            .get("location")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        html_link: value
+            .get("htmlLink")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+fn calendar_event_time(value: &serde_json::Value, field: &str) -> String {
+    let Some(object) = value.get(field).and_then(serde_json::Value::as_object) else {
+        return "Unknown".to_string();
+    };
+    if let Some(date_time) = object.get("dateTime").and_then(serde_json::Value::as_str) {
+        return format_due(date_time);
+    }
+    object
+        .get("date")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Unknown")
+        .to_string()
+}
+
+fn format_bytes(value: Option<u64>) -> String {
+    let Some(value) = value else {
+        return "n/a".to_string();
+    };
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = value as f64;
+    let mut index = 0usize;
+    while size >= 1024.0 && index < UNITS.len() - 1 {
+        size /= 1024.0;
+        index += 1;
+    }
+    if index == 0 {
+        format!("{} {}", value, UNITS[index])
+    } else {
+        format!("{size:.1} {}", UNITS[index])
+    }
+}
+
+fn system_diagnostics_lines(
+    info: Option<&serde_json::Value>,
+    active_model: Option<&str>,
+    ready: Option<bool>,
+    mode: LayoutMode,
+) -> Vec<Line<'static>> {
+    let runtime = info.and_then(|value| value.get("runtime"));
+    let hardware = info.and_then(|value| value.get("hardware"));
+    let generation = runtime.and_then(|value| value.get("generation"));
+    let memory = hardware.and_then(|value| value.get("memory"));
+    let gpu = hardware
+        .and_then(|value| value.get("gpu"))
+        .and_then(|value| value.get("devices"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|devices| devices.first());
+    let network = info
+        .and_then(|value| value.get("network"))
+        .and_then(|value| value.get("default_interface"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("none");
+
+    let pid = runtime
+        .and_then(|value| value.get("pid"))
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "n/a".to_string());
+    let endpoint = generation
+        .and_then(|value| value.get("endpoint"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("n/a");
+    let generation_reachable = generation
+        .and_then(|value| value.get("reachable"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let total = memory
+        .and_then(|value| value.get("total_bytes"))
+        .and_then(serde_json::Value::as_u64);
+    let used = memory
+        .and_then(|value| value.get("used_bytes"))
+        .and_then(serde_json::Value::as_u64);
+    let gpu_name = gpu
+        .and_then(|value| value.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            gpu.and_then(|value| value.get("description"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("none");
+    let gpu_vram = gpu
+        .and_then(|value| {
+            let total = value
+                .get("vram_total_mib")
+                .and_then(serde_json::Value::as_u64)?;
+            let used = value
+                .get("vram_used_mib")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            Some(format!("{used} / {total} MiB"))
+        })
+        .unwrap_or_else(|| "n/a".to_string());
+
+    if mode == LayoutMode::Mini {
+        return vec![
+            Line::from(Span::styled("Live runtime", section_style())),
+            Line::from(format!("Active: {}", active_model.unwrap_or("none"))),
+            Line::from(format!("Ready: {}  PID: {}", ready.unwrap_or(false), pid)),
+        ];
+    }
+
+    vec![
+        Line::from(Span::styled("Live runtime diagnostics", section_style())),
+        Line::from(format!("Active: {}", active_model.unwrap_or("none"))),
+        Line::from(format!("Ready: {}   PID: {}", ready.unwrap_or(false), pid)),
+        Line::from(format!(
+            "Generation: {} ({})",
+            endpoint,
+            if generation_reachable {
+                "reachable"
+            } else {
+                "unreachable"
+            }
+        )),
+        Line::from(format!(
+            "RAM: {} / {}   Network: {}",
+            format_bytes(used),
+            format_bytes(total),
+            network
+        )),
+        Line::from(format!(
+            "GPU: {}   VRAM: {}",
+            compact(gpu_name, 36),
+            gpu_vram
+        )),
+    ]
 }
 
 fn format_backend_timestamp(value: &str) -> Option<String> {
@@ -4317,6 +5480,25 @@ fn compare_due(left: Option<&str>, right: Option<&str>) -> std::cmp::Ordering {
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => std::cmp::Ordering::Equal,
     }
+}
+
+fn format_due_input(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return String::new();
+    };
+    let Ok(parsed) = OffsetDateTime::parse(value, &Rfc3339) else {
+        return value.to_string();
+    };
+    let local =
+        parsed.to_offset(time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC));
+    format!(
+        "{:02}/{:02}/{:04} {:02}:{:02}",
+        local.day(),
+        local.month() as u8,
+        local.year(),
+        local.hour(),
+        local.minute()
+    )
 }
 
 fn format_due(value: &str) -> String {
@@ -4673,6 +5855,7 @@ fn command_suggestions(input: &str) -> Vec<String> {
         ":model",
         ":search",
         ":refresh",
+        ":calendar-login",
         ":file <path>",
         ":help",
     ]
@@ -4713,6 +5896,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             let mut app = App::new(lease, socket_path.clone())?;
             loop {
                 app.poll_chat_response();
+                app.poll_approvals();
+                app.poll_approval_response();
+                app.poll_calendar_login();
                 app.poll_runtime_restart();
                 app.poll_runtime_health();
                 terminal.draw(|frame| app.draw(frame))?;
@@ -4727,6 +5913,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Err(error) => Err(error),
     };
 
+    drain_pending_terminal_events()?;
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -4738,6 +5925,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     terminal.backend_mut().flush()?;
     terminal.show_cursor()?;
     result
+}
+
+fn drain_pending_terminal_events() -> Result<(), Box<dyn Error>> {
+    while event::poll(Duration::ZERO)? {
+        let _ = event::read()?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5071,6 +6265,20 @@ mod tests {
     }
 
     #[test]
+    fn session_title_from_history_uses_first_user_message() {
+        let chat = vec![ChatExchange {
+            user: "Plan the RCM analytics rollout".to_string(),
+            assistant: Some("Let's break it down.".to_string()),
+        }];
+        let title = chat
+            .first()
+            .map(|exchange| compact(&exchange.user.replace(['\n', '\r'], " "), 48))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "New session".to_string());
+        assert_eq!(title, "Plan the RCM analytics rollout");
+    }
+
+    #[test]
     fn backend_task_summary_maps_to_ui_task() {
         let task = ui_task_from_backend(assistant_protocol::TaskSummary {
             id: "task:123".to_string(),
@@ -5124,6 +6332,8 @@ mod tests {
             due_at: Some("2026-09-24T04:00:00Z".to_string()),
             created_at: Some("2026-09-21T10:00:00Z".to_string()),
             updated_at: Some("2026-09-21T11:00:00Z".to_string()),
+            calendar_sync_enabled: true,
+            calendar_sync_status: Some("synced".to_string()),
         });
         assert_eq!(reminder.id, "reminder:test");
         assert_eq!(reminder.title, "Review report");
@@ -5132,6 +6342,8 @@ mod tests {
         assert!(reminder.due_at.is_some());
         assert!(!reminder.created_at.is_empty());
         assert!(!reminder.updated_at.is_empty());
+        assert!(reminder.calendar_sync_enabled);
+        assert_eq!(reminder.calendar_sync_status.as_deref(), Some("synced"));
     }
 
     #[test]
@@ -5161,6 +6373,72 @@ mod tests {
         assert_eq!(proposal.item_count, 1);
         assert!(!proposal.created_at.is_empty());
         assert!(!proposal.updated_at.is_empty());
+    }
+
+    #[test]
+    fn calendar_event_mapping_extracts_summary_and_times() {
+        let event = ui_calendar_event_from_backend(serde_json::json!({
+            "id": "event-1",
+            "summary": "Zaraki review",
+            "status": "confirmed",
+            "start": {"dateTime": "2026-09-24T12:00:00Z"},
+            "end": {"dateTime": "2026-09-24T12:30:00Z"},
+            "location": "Home",
+            "htmlLink": "https://calendar.google.com/event",
+        }))
+        .expect("event should map");
+        assert_eq!(event.id, "event-1");
+        assert_eq!(event.summary, "Zaraki review");
+        assert_eq!(event.status, "confirmed");
+        assert!(!event.start.is_empty());
+        assert!(!event.end.is_empty());
+        assert_eq!(event.location, "Home");
+        assert_eq!(event.html_link, "https://calendar.google.com/event");
+    }
+
+    #[test]
+    fn system_diagnostics_use_live_values_without_placeholder_model_stats() {
+        let info = serde_json::json!({
+            "hardware": {
+                "memory": {
+                    "total_bytes": 4096,
+                    "used_bytes": 2048
+                },
+                "gpu": {
+                    "devices": [{
+                        "name": "Test GPU",
+                        "vram_total_mib": 1024,
+                        "vram_used_mib": 256
+                    }]
+                }
+            },
+            "runtime": {
+                "pid": 42,
+                "generation": {
+                    "endpoint": "http://127.0.0.1:8080",
+                    "reachable": true
+                }
+            },
+            "network": {
+                "default_interface": "eth0"
+            }
+        });
+        let lines =
+            system_diagnostics_lines(Some(&info), Some("Qwen"), Some(true), LayoutMode::Full);
+        let rendered = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert!(rendered.contains("PID: 42"));
+        assert!(rendered.contains("eth0"));
+        assert!(rendered.contains("Test GPU"));
+        assert!(rendered.contains("256 / 1024 MiB"));
+        assert!(rendered.contains("2.0 KiB"));
+        assert!(!rendered.contains("Generation: n/a"));
     }
 
     #[test]
@@ -5198,6 +6476,34 @@ mod tests {
         assert_eq!(form.values[3], tasks[0].status);
         assert_eq!(form.values[4], tasks[0].priority);
         assert_eq!(form.values[5], tasks[0].project.clone().unwrap());
+    }
+
+    #[test]
+    fn form_edit_due_uses_local_editable_date_format() {
+        let reminder = UiReminder {
+            id: "reminder:test".to_string(),
+            title: "Test".to_string(),
+            body: String::new(),
+            status: "scheduled".to_string(),
+            due_at: Some("2026-09-24T12:30:00Z".to_string()),
+            created_at: String::new(),
+            updated_at: String::new(),
+            calendar_sync_enabled: true,
+            calendar_sync_status: Some("synced".to_string()),
+        };
+        let form = FormState::reminder_edit(&reminder);
+        let expected_local = OffsetDateTime::parse("2026-09-24T12:30:00Z", &Rfc3339)
+            .expect("test timestamp")
+            .to_offset(time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC));
+        let expected = format!(
+            "{:02}/{:02}/{:04} {:02}:{:02}",
+            expected_local.day(),
+            expected_local.month() as u8,
+            expected_local.year(),
+            expected_local.hour(),
+            expected_local.minute()
+        );
+        assert_eq!(form.values[2], expected);
     }
 
     #[test]
@@ -5281,6 +6587,7 @@ mod tests {
     fn command_suggestions_are_chat_specific() {
         assert!(command_suggestions(":").len() >= 4);
         assert!(command_suggestions(":mo").contains(&":model".to_string()));
+        assert!(command_suggestions(":ca").contains(&":calendar-login".to_string()));
     }
 
     #[test]
@@ -5298,12 +6605,6 @@ mod tests {
         assert!(model.available);
         assert!(model.active);
         assert_eq!(model.capabilities, vec!["controller", "general_response"]);
-        assert_eq!(model.location, "LOCAL");
-        assert_eq!(model.endpoint, "n/a");
-        assert_eq!(model.context, "n/a");
-        assert_eq!(model.vram, "n/a");
-        assert_eq!(model.pid, "n/a");
-        assert_eq!(model.speed, "n/a");
     }
 
     #[test]
@@ -5315,12 +6616,6 @@ mod tests {
                 available: true,
                 active: false,
                 capabilities: vec![],
-                location: "LOCAL".into(),
-                endpoint: "local".into(),
-                context: "4096".into(),
-                vram: "demo".into(),
-                pid: "demo".into(),
-                speed: "demo".into(),
             },
             UiModel {
                 id: "cloud:test".into(),
@@ -5328,12 +6623,6 @@ mod tests {
                 available: false,
                 active: false,
                 capabilities: vec![],
-                location: "CLOUD".into(),
-                endpoint: "cloud".into(),
-                context: "provider".into(),
-                vram: "n/a".into(),
-                pid: "n/a".into(),
-                speed: "n/a".into(),
             },
             UiModel {
                 id: "qwen".into(),
@@ -5341,12 +6630,6 @@ mod tests {
                 available: true,
                 active: true,
                 capabilities: vec![],
-                location: "LOCAL".into(),
-                endpoint: "local".into(),
-                context: "4096".into(),
-                vram: "demo".into(),
-                pid: "demo".into(),
-                speed: "demo".into(),
             },
         ];
         let selected = models.iter().filter(|model| model.available).nth(1);
@@ -5356,7 +6639,10 @@ mod tests {
     #[test]
     fn form_defaults_match_backend_status_names() {
         assert_eq!(FormState::task_create().values[3], "open");
-        assert!(FormState::reminder_create().values[0].is_empty());
+        let reminder = FormState::reminder_create();
+        assert!(reminder.values[0].is_empty());
+        assert_eq!(reminder.values[3], "no");
+        assert_eq!(reminder.labels[3], "Calendar Sync");
     }
 
     #[test]

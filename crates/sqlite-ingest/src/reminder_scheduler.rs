@@ -147,6 +147,15 @@ impl<N: Notifier> ReminderScheduler<N> {
     /// there is no need to involve the embedding server just to flip a
     /// status flag.
     pub fn check_and_trigger_due_reminders(&mut self) -> Result<usize> {
+        // Reconcile Markdown -> SQLite before evaluating due reminders. The
+        // scheduler owns a long-lived SQLite connection, while reminder
+        // mutations can arrive through the TUI or another IPC client. Without
+        // this refresh, a reminder rescheduled in Markdown can remain visible
+        // to the scheduler at its old due time.
+        let snapshot = indexer::build_snapshot_from(&self.root)?;
+        self.db.sync_snapshot(&snapshot)?;
+        self.db.sync_semantics(&snapshot)?;
+
         let now = OffsetDateTime::now_utc();
         // A generous limit: this is a personal second brain, not a
         // multi-tenant system, and the query is cheap. Revisit if reminder
@@ -363,6 +372,54 @@ mod tests {
         let verify = SqliteMemoryDb::open(&db_path)?;
         assert_eq!(verify.reminders(Some("scheduled"), 10)?.len(), 0);
         assert_eq!(verify.reminders(Some("triggered"), 10)?.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_and_trigger_reconciles_rescheduled_reminders_before_triggering() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("memory");
+        fs::create_dir_all(&root)?;
+        let db_path = temp.path().join("assistant.db");
+
+        let mut db = SqliteMemoryDb::open(&db_path)?;
+        db.initialize_schema()?;
+        seed_reminder(&root, &db_path, "Reschedule me", "2020-01-01T09:00:00Z")?;
+        refresh(&root, &mut db)?;
+
+        let reminder = db
+            .reminders(Some("scheduled"), 10)?
+            .into_iter()
+            .next()
+            .ok_or("seed reminder was not indexed")?;
+        let note_path = db
+            .note_path(&reminder.note_id)?
+            .ok_or("seed reminder note path was not indexed")?;
+        let note = root.join(note_path);
+        let content = fs::read_to_string(&note)?;
+        let updated = content.replace(
+            "due_at: \"2020-01-01T09:00:00Z\"",
+            "due_at: \"2099-01-01T09:00:00Z\"",
+        );
+        assert_ne!(
+            updated, content,
+            "seed reminder due_at was not found in Markdown"
+        );
+        fs::write(&note, updated)?;
+
+        // Do not refresh SQLite here. The scheduler must reconcile the
+        // authoritative Markdown state before deciding what is due.
+        let mut scheduler = ReminderScheduler::new(&root, &db_path, RecordingNotifier::new())?;
+        let triggered = scheduler.check_and_trigger_due_reminders()?;
+
+        assert_eq!(triggered, 0);
+        assert!(scheduler.notifier.calls.borrow().is_empty());
+        let verify = SqliteMemoryDb::open(&db_path)?;
+        let scheduled = verify.reminders(Some("scheduled"), 10)?;
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].due_at.as_deref(), Some("2099-01-01T09:00:00Z"));
+        assert_eq!(verify.reminders(Some("triggered"), 10)?.len(), 0);
 
         Ok(())
     }

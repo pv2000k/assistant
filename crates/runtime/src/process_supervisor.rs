@@ -18,6 +18,7 @@ const SERVICE_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(90);
 const SERVICE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MIN_MAINLINE_TERNARY_BUILD: u64 = 10_240;
 
 #[derive(Debug)]
 pub struct LocalServiceSupervisor {
@@ -156,15 +157,85 @@ impl ManagedProcess {
     }
 }
 
+fn validate_ternary_model_compatibility(
+    model: &str,
+    llama_root: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let name = Path::new(model)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+
+    if !name.contains("ternary-bonsai") {
+        return Ok(());
+    }
+
+    if name.ends_with("q2_0.gguf") {
+        return Err(format!(
+            "Ternary-Bonsai model '{}' uses the legacy group-128 Q2_0 format. Stock llama.cpp does not load this format; use the matching '*_Q2_0_g64.gguf' model with a recent mainline llama.cpp build instead.",
+            model
+        )
+        .into());
+    }
+
+    if !name.ends_with("q2_0_g64.gguf") {
+        return Ok(());
+    }
+
+    let build = llama_server_build_number(llama_root)?;
+    if let Some(build) = build {
+        if build < MIN_MAINLINE_TERNARY_BUILD {
+            return Err(format!(
+                "Ternary-Bonsai group-64 model '{}' requires a newer mainline llama.cpp build. Zaraki detected build b{build}; use a build at or above b{MIN_MAINLINE_TERNARY_BUILD} before starting this model.",
+                model
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+fn llama_server_build_number(llama_root: &Path) -> Result<Option<u64>, Box<dyn Error>> {
+    let output = Command::new("nix")
+        .arg("develop")
+        .arg(llama_root)
+        .arg("-c")
+        .arg("llama-server")
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("Could not query llama-server version: {error}"))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let rest = trimmed.strip_prefix("version:")?.trim();
+        let digits = rest.strip_prefix('b').unwrap_or(rest);
+        digits
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+    }))
+}
+
 fn ensure_generation_service(
     url: &str,
     model: &str,
     model_path: &Path,
     llama_root: &Path,
 ) -> Result<ManagedProcess, Box<dyn Error>> {
+    validate_ternary_model_compatibility(model, llama_root)?;
+
     if let Some(served) = ready_model(url)? {
         if served == model {
-            println!("Local generation model already running: {model}");
+            println!(
+                "Local generation model already running: {model}. Zaraki will reuse it and will not stop that external process."
+            );
             return Ok(ManagedProcess::reused("generation model"));
         }
 
@@ -197,7 +268,9 @@ fn ensure_embedding_service(
 ) -> Result<ManagedProcess, Box<dyn Error>> {
     if let Some(served) = ready_model(url)? {
         if served == model {
-            println!("Embedding model already running: {model}");
+            println!(
+                "Embedding model already running: {model}. Zaraki will reuse it and will not stop that external process."
+            );
             return Ok(ManagedProcess::reused("embedding model"));
         }
 
@@ -463,6 +536,37 @@ fn parse_http_endpoint(url: &str) -> Result<(String, String), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reused_process_is_not_owned() {
+        let process = ManagedProcess::reused("test");
+        assert!(!process.is_owned());
+    }
+
+    #[test]
+    fn ternary_legacy_model_is_rejected() {
+        let root = Path::new("/tmp/local-ai");
+        let error =
+            validate_ternary_model_compatibility("Ternary-Bonsai-8B-Q2_0.gguf", root).unwrap_err();
+        assert!(error.to_string().contains("legacy group-128"));
+    }
+
+    #[test]
+    fn non_ternary_models_do_not_require_version_checks() {
+        validate_ternary_model_compatibility("Qwen3.5-4B-Q4_K_M.gguf", Path::new("/tmp/local-ai"))
+            .unwrap();
+    }
+
+    #[test]
+    fn llama_server_build_number_parser_accepts_version_line() {
+        let line = "version: 10240 (4b87d7)";
+        let rest = line.trim_start_matches("version:").trim();
+        let build = rest
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok());
+        assert_eq!(build, Some(10240));
+    }
 
     #[test]
     fn parses_local_http_endpoint() {

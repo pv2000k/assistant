@@ -47,6 +47,12 @@ fn apply_field(meta: &mut NoteMeta, key: &str, value: &str) {
         "memory_kind" => meta.memory_kind = Some(strip_quotes(value)),
         "task_status" => meta.task_status = Some(strip_quotes(value)),
         "reminder_status" => meta.reminder_status = Some(strip_quotes(value)),
+        "calendar_sync_enabled" => meta.calendar_sync_enabled = parse_bool(value),
+        "google_calendar_id" => meta.google_calendar_id = Some(strip_quotes(value)),
+        "google_event_id" => meta.google_event_id = Some(strip_quotes(value)),
+        "calendar_sync_status" => meta.calendar_sync_status = Some(strip_quotes(value)),
+        "calendar_last_synced_at" => meta.calendar_last_synced_at = Some(strip_quotes(value)),
+        "calendar_sync_error" => meta.calendar_sync_error = Some(strip_quotes(value)),
 
         "captured_at" => meta.captured_at = Some(strip_quotes(value)),
         "occurred_at" => meta.occurred_at = Some(strip_quotes(value)),
@@ -130,10 +136,29 @@ pub fn parse(content: &str) -> ParsedMarkdown {
                 let key = key.trim();
 
                 match key {
-                    "id" | "title" | "note_type" | "type" | "namespace" | "canonical"
-                    | "status" | "memory_kind" | "task_status" | "reminder_status"
-                    | "captured_at" | "occurred_at" | "valid_from" | "valid_to" | "due_at"
-                    | "updated_at" | "created_at" => {
+                    "id"
+                    | "title"
+                    | "note_type"
+                    | "type"
+                    | "namespace"
+                    | "canonical"
+                    | "status"
+                    | "memory_kind"
+                    | "task_status"
+                    | "reminder_status"
+                    | "calendar_sync_enabled"
+                    | "google_calendar_id"
+                    | "google_event_id"
+                    | "calendar_sync_status"
+                    | "calendar_last_synced_at"
+                    | "calendar_sync_error"
+                    | "captured_at"
+                    | "occurred_at"
+                    | "valid_from"
+                    | "valid_to"
+                    | "due_at"
+                    | "updated_at"
+                    | "created_at" => {
                         apply_field(&mut metadata, key, value.trim());
                         continue;
                     }
@@ -521,6 +546,38 @@ Ping."#,
             reminder.metadata.reminder_status.as_deref(),
             Some("scheduled")
         );
+
+        let synced = parse(
+            r#"---
+memory_kind: reminder
+reminder_status: scheduled
+calendar_sync_enabled: true
+google_calendar_id: primary
+google_event_id: event-123
+calendar_sync_status: synced
+calendar_last_synced_at: 2026-09-22T10:00:00Z
+calendar_sync_error: ""
+---
+Call Mom."#,
+        );
+        assert_eq!(synced.metadata.calendar_sync_enabled, Some(true));
+        assert_eq!(
+            synced.metadata.google_calendar_id.as_deref(),
+            Some("primary")
+        );
+        assert_eq!(
+            synced.metadata.google_event_id.as_deref(),
+            Some("event-123")
+        );
+        assert_eq!(
+            synced.metadata.calendar_sync_status.as_deref(),
+            Some("synced")
+        );
+        assert_eq!(
+            synced.metadata.calendar_last_synced_at.as_deref(),
+            Some("2026-09-22T10:00:00Z")
+        );
+        assert_eq!(synced.metadata.calendar_sync_error.as_deref(), Some(""));
     }
 
     #[test]

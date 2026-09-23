@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+CALENDAR_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/assistant/google-calendar.env"
+if [[ -f "$CALENDAR_ENV" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$CALENDAR_ENV"
+    set +a
+fi
+
+if ! command -v cargo >/dev/null 2>&1 || [[ -z "${IN_NIX_SHELL:-}" ]]; then
+    exec nix develop "$ROOT" -c "$ROOT/scripts/assistant-tui" "$@"
+fi
+
+cd "$ROOT"
+cargo build -p runtime -p assistant-tui
+exec "$ROOT/target/debug/assistant-tui" "$@"

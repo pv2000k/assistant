@@ -1482,6 +1482,7 @@ version = "0.1.0"
 dependencies = [
  "assistant-client",
  "assistant-protocol",
+ "indexer",
  "libc",
  "model-router",
  "orchestrator",
@@ -2035,6 +2036,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "indexer",
+ "libc",
  "rand",
  "reqwest",
  "serde",

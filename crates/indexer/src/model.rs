@@ -9,6 +9,12 @@ pub struct NoteMeta {
     pub memory_kind: Option<String>,
     pub task_status: Option<String>,
     pub reminder_status: Option<String>,
+    pub calendar_sync_enabled: Option<bool>,
+    pub google_calendar_id: Option<String>,
+    pub google_event_id: Option<String>,
+    pub calendar_sync_status: Option<String>,
+    pub calendar_last_synced_at: Option<String>,
+    pub calendar_sync_error: Option<String>,
 
     pub captured_at: Option<String>,
     pub occurred_at: Option<String>,

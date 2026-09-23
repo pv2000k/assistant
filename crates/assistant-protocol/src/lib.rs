@@ -37,11 +37,22 @@ pub enum RequestMethod {
     Health,
     Chat {
         text: String,
+        #[serde(default)]
+        attachments: Vec<ChatAttachment>,
+    },
+    SessionNew,
+    SessionHistory {
+        #[serde(default)]
+        limit: Option<usize>,
     },
     ModelList,
     ModelStatus,
     ModelSwitch {
         model: String,
+    },
+    SystemInfo {
+        #[serde(default)]
+        scope: Option<String>,
     },
     TasksList {
         #[serde(default)]
@@ -76,6 +87,31 @@ pub enum RequestMethod {
         #[serde(default)]
         limit: Option<usize>,
     },
+    CalendarLogin,
+    CalendarStatus,
+    CalendarEventsList {
+        #[serde(default)]
+        calendar_id: Option<String>,
+        #[serde(default)]
+        time_min: Option<String>,
+        #[serde(default)]
+        time_max: Option<String>,
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(default)]
+        max_results: Option<u64>,
+        #[serde(default)]
+        page_token: Option<String>,
+    },
+    CalendarEventGet {
+        #[serde(default)]
+        calendar_id: Option<String>,
+        event_id: String,
+    },
+    CalendarEventMutate {
+        operation: String,
+        arguments: serde_json::Value,
+    },
     TasksMutate {
         operation: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +143,13 @@ pub enum RequestMethod {
             deserialize_with = "deserialize_optional_optional_string"
         )]
         due: Option<Option<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        calendar_sync: Option<bool>,
+    },
+    ApprovalsList,
+    ApprovalRespond {
+        id: u64,
+        approved: bool,
     },
     ClientAcquire {
         client_id: String,
@@ -181,15 +224,28 @@ pub enum ResponsePayload {
     Pong,
     Health(HealthStatus),
     Chat(ChatResponse),
+    Session(SessionState),
+    SessionHistory(SessionHistoryResponse),
     Models(ModelList),
     ModelStatus(ModelState),
+    SystemInfo(serde_json::Value),
     Tasks(TaskList),
     Reminders(ReminderList),
     Memory(MemorySearchResult),
     Proposals(MemoryProposalList),
     Jobs(JobList),
+    CalendarStatus(CalendarStatus),
+    CalendarEvents(CalendarEvents),
+    CalendarEvent(CalendarEvent),
     Mutation(MutationResult),
+    Approvals(ApprovalList),
+    Approval(ApprovalStatus),
     Lease(LeaseStatus),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatAttachment {
+    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +263,42 @@ pub struct HealthStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatResponse {
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionState {
+    pub session_id: String,
+    pub turn_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatTurn {
+    pub user: String,
+    pub assistant: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHistoryResponse {
+    pub session_id: String,
+    pub turns: Vec<ChatTurn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalRequestSummary {
+    pub id: u64,
+    pub tool: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalList {
+    pub approvals: Vec<ApprovalRequestSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalStatus {
+    pub id: u64,
+    pub approved: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,6 +351,8 @@ pub struct ReminderSummary {
     pub due_at: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    pub calendar_sync_enabled: bool,
+    pub calendar_sync_status: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -306,6 +400,29 @@ pub struct JobSummary {
     pub next_run_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarStatus {
+    pub configured: bool,
+    pub authenticated: bool,
+    pub write_enabled: bool,
+    pub calendar_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalendarEvents {
+    pub calendar_id: String,
+    pub events: Vec<serde_json::Value>,
+    pub count: usize,
+    pub next_page_token: Option<String>,
+    pub time_zone: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalendarEvent {
+    pub calendar_id: String,
+    pub event: serde_json::Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MutationResult {
     pub tool: String,
@@ -324,6 +441,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_new_request_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let request = WireRequest::new(6, RequestMethod::SessionNew);
+        let encoded = request.encode_line()?;
+        let decoded = WireRequest::decode_line(&encoded)?;
+        assert_eq!(decoded, request);
+        Ok(())
+    }
+
+    #[test]
+    fn session_history_request_and_response_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let request = WireRequest::new(7, RequestMethod::SessionHistory { limit: Some(12) });
+        let encoded = request.encode_line()?;
+        let decoded = WireRequest::decode_line(&encoded)?;
+        assert_eq!(decoded, request);
+
+        let response = WireResponse::ok(
+            7,
+            ResponsePayload::SessionHistory(SessionHistoryResponse {
+                session_id: "session-test".to_string(),
+                turns: vec![ChatTurn {
+                    user: "Hello".to_string(),
+                    assistant: "Hi there.".to_string(),
+                }],
+            }),
+        );
+        let response_encoded = response.encode_line()?;
+        let response_decoded = WireResponse::decode_line(&response_encoded)?;
+        assert_eq!(response_decoded, response);
+        Ok(())
+    }
+
+    #[test]
     fn model_switch_request_round_trips() -> Result<(), Box<dyn std::error::Error>> {
         let request = WireRequest::new(
             7,
@@ -340,10 +489,51 @@ mod tests {
     }
 
     #[test]
+    fn chat_request_with_attachment_round_trips() {
+        let request = WireRequest::new(
+            8,
+            RequestMethod::Chat {
+                text: "Summarize this file".to_string(),
+                attachments: vec![ChatAttachment {
+                    path: "/tmp/report.txt".to_string(),
+                }],
+            },
+        );
+
+        let encoded = request.encode_line().expect("encode request");
+        let decoded = WireRequest::decode_line(&encoded).expect("decode request");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
     fn default_limits_are_applied() {
         assert_eq!(RequestMethod::list_limit(None), DEFAULT_LIST_LIMIT);
         assert_eq!(RequestMethod::list_limit(Some(0)), 1);
         assert_eq!(RequestMethod::list_limit(Some(25)), 25);
+    }
+
+    #[test]
+    fn system_info_request_and_response_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let request = WireRequest::new(
+            8,
+            RequestMethod::SystemInfo {
+                scope: Some("all".to_string()),
+            },
+        );
+        let encoded = request.encode_line()?;
+        let decoded = WireRequest::decode_line(&encoded)?;
+        assert_eq!(decoded, request);
+
+        let response = WireResponse::ok(
+            8,
+            ResponsePayload::SystemInfo(serde_json::json!({
+                "runtime": {"ready": true}
+            })),
+        );
+        let encoded = response.encode_line()?;
+        let decoded = WireResponse::decode_line(&encoded)?;
+        assert_eq!(decoded, response);
+        Ok(())
     }
 
     #[test]
@@ -434,6 +624,7 @@ mod tests {
                 title: None,
                 body: None,
                 due: None,
+                calendar_sync: None,
             },
         );
 
@@ -458,6 +649,7 @@ mod tests {
                 title: None,
                 body: None,
                 due: Some(None),
+                calendar_sync: None,
             },
         );
 
@@ -486,6 +678,7 @@ mod tests {
                 title: Some("Review RCM report".to_string()),
                 body: Some("Send notes to finance.".to_string()),
                 due: Some(Some("tomorrow at 6 PM".to_string())),
+                calendar_sync: Some(true),
             },
         );
 
@@ -539,6 +732,122 @@ mod tests {
 
         let decoded = WireResponse::decode_line(&response.encode_line()?)?;
         assert_eq!(decoded, response);
+        Ok(())
+    }
+
+    #[test]
+    fn calendar_requests_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let list = WireRequest::new(
+            20,
+            RequestMethod::CalendarEventsList {
+                calendar_id: Some("primary".to_string()),
+                time_min: Some("2026-09-22T00:00:00Z".to_string()),
+                time_max: None,
+                query: Some("Zaraki".to_string()),
+                max_results: Some(10),
+                page_token: None,
+            },
+        );
+        let get = WireRequest::new(
+            21,
+            RequestMethod::CalendarEventGet {
+                calendar_id: None,
+                event_id: "event-123".to_string(),
+            },
+        );
+        let mutate = WireRequest::new(
+            22,
+            RequestMethod::CalendarEventMutate {
+                operation: "create".to_string(),
+                arguments: serde_json::json!({
+                    "summary": "Zaraki reminder",
+                    "start": {"dateTime": "2026-09-22T18:00:00+05:30"},
+                    "end": {"dateTime": "2026-09-22T18:30:00+05:30"}
+                }),
+            },
+        );
+
+        assert_eq!(WireRequest::decode_line(&list.encode_line()?)?, list);
+        assert_eq!(WireRequest::decode_line(&get.encode_line()?)?, get);
+        assert_eq!(WireRequest::decode_line(&mutate.encode_line()?)?, mutate);
+        Ok(())
+    }
+
+    #[test]
+    fn calendar_login_request_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let request = WireRequest::new(19, RequestMethod::CalendarLogin);
+        assert_eq!(WireRequest::decode_line(&request.encode_line()?)?, request);
+        Ok(())
+    }
+
+    #[test]
+    fn calendar_status_response_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let response = WireResponse::ok(
+            23,
+            ResponsePayload::CalendarStatus(CalendarStatus {
+                configured: true,
+                authenticated: true,
+                write_enabled: true,
+                calendar_id: "primary".to_string(),
+            }),
+        );
+
+        assert_eq!(
+            WireResponse::decode_line(&response.encode_line()?)?,
+            response
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn approval_requests_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let list = WireRequest::new(24, RequestMethod::ApprovalsList);
+        let respond = WireRequest::new(
+            25,
+            RequestMethod::ApprovalRespond {
+                id: 7,
+                approved: true,
+            },
+        );
+
+        assert_eq!(WireRequest::decode_line(&list.encode_line()?)?, list);
+        assert_eq!(WireRequest::decode_line(&respond.encode_line()?)?, respond);
+        Ok(())
+    }
+
+    #[test]
+    fn approval_responses_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let response = WireResponse::ok(
+            26,
+            ResponsePayload::Approvals(ApprovalList {
+                approvals: vec![ApprovalRequestSummary {
+                    id: 7,
+                    tool: "reminders.mutate".to_string(),
+                    arguments: serde_json::json!({
+                        "operation": "create",
+                        "title": "Review RCM report"
+                    }),
+                }],
+            }),
+        );
+
+        assert_eq!(
+            WireResponse::decode_line(&response.encode_line()?)?,
+            response
+        );
+
+        let decision = WireResponse::ok(
+            27,
+            ResponsePayload::Approval(ApprovalStatus {
+                id: 7,
+                approved: true,
+            }),
+        );
+        assert_eq!(
+            WireResponse::decode_line(&decision.encode_line()?)?,
+            decision
+        );
+
         Ok(())
     }
 

@@ -32,3 +32,12 @@ logs/
 .idea/
 .direnv/
 .DS_Store
+
+# Google OAuth local credentials
+credentials.json
+client_secret*.json
+google-calendar-token.json
+
+# Patch artifacts
+*.orig
+*.rej

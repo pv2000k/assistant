@@ -26,6 +26,9 @@
         ];
 
         shellHook = ''
+          export ASSISTANT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+          export PATH="$ASSISTANT_ROOT/scripts:$PATH"
+
           echo "=========================================="
           echo " Personal Assistant Development Environment"
           echo "=========================================="
@@ -34,6 +37,7 @@
           echo "OpenSSL: $(pkg-config --modversion openssl)"
           echo "CMake:   $(cmake --version | head -n 1)"
           echo
+          echo "Launcher: assistant-tui"
         '';
       };
     };

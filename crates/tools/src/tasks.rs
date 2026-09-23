@@ -14,6 +14,7 @@ use time::{
     format_description::well_known::Rfc3339,
 };
 
+use crate::calendar_sync::ReminderCalendarSync;
 use crate::{Result, Tool, ToolDefinition, ToolPermission, ToolResult};
 
 const DEFAULT_LIST_LIMIT: usize = 20;
@@ -115,6 +116,8 @@ struct MutationArguments {
     due: Option<Option<String>>,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    calendar_sync: Option<bool>,
 }
 
 fn default_limit() -> usize {
@@ -195,7 +198,7 @@ fn parse_date(value: &str) -> Result<Date> {
     let separator = if value.contains('/') { '/' } else { '-' };
     let parts = value.split(separator).collect::<Vec<_>>();
     if parts.len() != 3 {
-        return Err("Date must use DD/MM/YYYY or YYYY-MM-DD.".into());
+        return Err("Date must use DD/MM/YYYY, DD-MM-YY, DD-MM-YYYY, or YYYY-MM-DD.".into());
     }
 
     let (year, month_number, day) = if separator == '/' {
@@ -203,10 +206,22 @@ fn parse_date(value: &str) -> Result<Date> {
         let month_number: u8 = parts[1].parse().map_err(|_| "Date month is invalid.")?;
         let year: i32 = parts[2].parse().map_err(|_| "Date year is invalid.")?;
         (year, month_number, day)
-    } else {
+    } else if parts[0].len() == 4 {
         let year: i32 = parts[0].parse().map_err(|_| "Date year is invalid.")?;
         let month_number: u8 = parts[1].parse().map_err(|_| "Date month is invalid.")?;
         let day: u8 = parts[2].parse().map_err(|_| "Date day is invalid.")?;
+        (year, month_number, day)
+    } else {
+        let day: u8 = parts[0].parse().map_err(|_| "Date day is invalid.")?;
+        let month_number: u8 = parts[1].parse().map_err(|_| "Date month is invalid.")?;
+        let raw_year: i32 = parts[2].parse().map_err(|_| "Date year is invalid.")?;
+        let year = if parts[2].len() == 2 {
+            2000 + raw_year
+        } else if parts[2].len() == 4 {
+            raw_year
+        } else {
+            return Err("Date year must use YY or YYYY.".into());
+        };
         (year, month_number, day)
     };
 
@@ -340,13 +355,23 @@ fn parse_relative_duration(value: &str, now_utc: OffsetDateTime) -> Result<Optio
     };
 
     let parts = rest.split_whitespace().collect::<Vec<_>>();
-    if parts.len() != 2 {
-        return Err("Relative due times must look like 'in 2 hours'.".into());
+
+    if parts.as_slice() == ["half", "an", "hour"] {
+        return Ok(Some(now_utc.checked_add(Duration::minutes(30)).ok_or(
+            "Relative due time overflowed the supported date range.",
+        )?));
     }
 
-    let amount: i64 = parts[0]
-        .parse()
-        .map_err(|_| "Relative due time amount is invalid.")?;
+    if parts.len() != 2 {
+        return Err("Relative due times must look like 'in 2 hours' or 'in half an hour'.".into());
+    }
+
+    let amount: i64 = match parts[0] {
+        "a" | "an" => 1,
+        other => other
+            .parse()
+            .map_err(|_| "Relative due time amount is invalid.")?,
+    };
     if amount <= 0 {
         return Err("Relative due time amount must be positive.".into());
     }
@@ -536,6 +561,8 @@ fn render_new_note(
     status: &str,
     due_at: Option<&str>,
     created_at: &str,
+    calendar_sync_enabled: bool,
+    calendar_id: Option<&str>,
 ) -> String {
     let mut output = String::new();
     output.push_str("---\n");
@@ -559,6 +586,25 @@ fn render_new_note(
         output.push_str("due_at: ");
         output.push_str(&yaml_scalar(due_at));
         output.push('\n');
+    }
+    if kind == ItemKind::Reminder {
+        output.push_str("calendar_sync_enabled: ");
+        output.push_str(if calendar_sync_enabled {
+            "\"true\""
+        } else {
+            "\"false\""
+        });
+        output.push('\n');
+        if calendar_sync_enabled {
+            if let Some(calendar_id) = calendar_id {
+                output.push_str("google_calendar_id: ");
+                output.push_str(&yaml_scalar(calendar_id));
+                output.push('\n');
+            }
+            output.push_str("calendar_sync_status: \"pending\"\n");
+        } else {
+            output.push_str("calendar_sync_status: \"disabled\"\n");
+        }
     }
     output.push_str("created_at: ");
     output.push_str(&yaml_scalar(created_at));
@@ -798,6 +844,180 @@ fn mutate_markdown(
     }
 
     atomic_replace(path, &content)
+}
+
+#[derive(Debug, Clone, Default)]
+struct CalendarSyncMetadata {
+    enabled: bool,
+    calendar_id: Option<String>,
+    event_id: Option<String>,
+    status: Option<String>,
+    last_synced_at: Option<String>,
+    error: Option<String>,
+}
+
+fn read_calendar_sync_metadata(path: &Path) -> Result<CalendarSyncMetadata> {
+    let parsed = parse_markdown(&fs::read_to_string(path)?);
+    Ok(CalendarSyncMetadata {
+        enabled: parsed.metadata.calendar_sync_enabled.unwrap_or(false),
+        calendar_id: parsed.metadata.google_calendar_id,
+        event_id: parsed.metadata.google_event_id,
+        status: parsed.metadata.calendar_sync_status,
+        last_synced_at: parsed.metadata.calendar_last_synced_at,
+        error: parsed.metadata.calendar_sync_error,
+    })
+}
+
+fn persist_calendar_sync_metadata(path: &Path, metadata: &CalendarSyncMetadata) -> Result<()> {
+    let original = fs::read_to_string(path)?;
+    let mut content = original.clone();
+    content = set_top_level_field(
+        &content,
+        "calendar_sync_enabled",
+        Some(if metadata.enabled { "true" } else { "false" }),
+    )?;
+    content = set_top_level_field(
+        &content,
+        "google_calendar_id",
+        metadata.calendar_id.as_deref(),
+    )?;
+    content = set_top_level_field(&content, "google_event_id", metadata.event_id.as_deref())?;
+    content = set_top_level_field(&content, "calendar_sync_status", metadata.status.as_deref())?;
+    content = set_top_level_field(
+        &content,
+        "calendar_last_synced_at",
+        metadata.last_synced_at.as_deref(),
+    )?;
+    content = set_top_level_field(&content, "calendar_sync_error", metadata.error.as_deref())?;
+
+    if content != original {
+        atomic_replace(path, &content)?;
+    }
+    Ok(())
+}
+
+fn record_calendar_sync_failure(
+    path: &Path,
+    metadata: &CalendarSyncMetadata,
+    error: &str,
+) -> Result<()> {
+    let mut next = metadata.clone();
+    next.status = Some("error".to_string());
+    next.error = Some(error.to_string());
+    persist_calendar_sync_metadata(path, &next)
+}
+
+fn sync_created_reminder(
+    path: &Path,
+    sync: &ReminderCalendarSync,
+    title: &str,
+    body: &str,
+    due_at: Option<&str>,
+) -> Result<()> {
+    let mut metadata = read_calendar_sync_metadata(path)?;
+    if !metadata.enabled {
+        return Ok(());
+    }
+
+    let Some(due_at) = due_at else {
+        metadata.status = Some("skipped".to_string());
+        metadata.error =
+            Some("Reminder has no due time; no Calendar event was created.".to_string());
+        persist_calendar_sync_metadata(path, &metadata)?;
+        return Ok(());
+    };
+
+    let calendar_id = metadata
+        .calendar_id
+        .clone()
+        .unwrap_or_else(|| sync.calendar_id().to_string());
+    metadata.calendar_id = Some(calendar_id.clone());
+    metadata.status = Some("pending".to_string());
+    metadata.error = None;
+    persist_calendar_sync_metadata(path, &metadata)?;
+
+    match sync.create_event(&calendar_id, title, body, due_at) {
+        Ok((calendar_id, event_id)) => {
+            metadata.calendar_id = Some(calendar_id);
+            metadata.event_id = Some(event_id);
+            metadata.status = Some("synced".to_string());
+            metadata.last_synced_at = Some(now_timestamp()?);
+            metadata.error = None;
+            persist_calendar_sync_metadata(path, &metadata)
+        }
+        Err(error) => record_calendar_sync_failure(path, &metadata, &error.to_string()),
+    }
+}
+
+fn sync_updated_reminder(
+    path: &Path,
+    sync: &ReminderCalendarSync,
+    title: &str,
+    body: &str,
+    due_at: Option<&str>,
+) -> Result<()> {
+    let mut metadata = read_calendar_sync_metadata(path)?;
+    if !metadata.enabled {
+        return Ok(());
+    }
+
+    let calendar_id = metadata
+        .calendar_id
+        .clone()
+        .unwrap_or_else(|| sync.calendar_id().to_string());
+    metadata.calendar_id = Some(calendar_id.clone());
+
+    match (metadata.event_id.as_deref(), due_at) {
+        (Some(event_id), Some(due_at)) => {
+            match sync.update_event(&calendar_id, event_id, title, body, due_at) {
+                Ok(()) => {
+                    metadata.status = Some("synced".to_string());
+                    metadata.last_synced_at = Some(now_timestamp()?);
+                    metadata.error = None;
+                    persist_calendar_sync_metadata(path, &metadata)
+                }
+                Err(error) => record_calendar_sync_failure(path, &metadata, &error.to_string()),
+            }
+        }
+        (Some(_event_id), None) => {
+            metadata.status = Some("preserved".to_string());
+            metadata.last_synced_at = Some(now_timestamp()?);
+            metadata.error = None;
+            persist_calendar_sync_metadata(path, &metadata)
+        }
+        (None, Some(due_at)) => match sync.create_event(&calendar_id, title, body, due_at) {
+            Ok((_calendar_id, event_id)) => {
+                metadata.event_id = Some(event_id);
+                metadata.status = Some("synced".to_string());
+                metadata.last_synced_at = Some(now_timestamp()?);
+                metadata.error = None;
+                persist_calendar_sync_metadata(path, &metadata)
+            }
+            Err(error) => record_calendar_sync_failure(path, &metadata, &error.to_string()),
+        },
+        (None, None) => {
+            metadata.status = Some("skipped".to_string());
+            metadata.error =
+                Some("Reminder has no due time; no Calendar event was created.".to_string());
+            persist_calendar_sync_metadata(path, &metadata)
+        }
+    }
+}
+
+fn sync_cancelled_reminder(path: &Path) -> Result<()> {
+    let mut metadata = read_calendar_sync_metadata(path)?;
+    if !metadata.enabled {
+        return Ok(());
+    }
+
+    if metadata.event_id.is_some() {
+        metadata.status = Some("preserved".to_string());
+        metadata.last_synced_at = Some(now_timestamp()?);
+    } else {
+        metadata.status = Some("skipped".to_string());
+    }
+    metadata.error = None;
+    persist_calendar_sync_metadata(path, &metadata)
 }
 
 fn transition_allowed(kind: ItemKind, from: &str, to: &str) -> bool {
@@ -1118,11 +1338,19 @@ fn validate_mutation_shape(kind: ItemKind, arguments: &MutationArguments) -> Res
         return Err(format!("{operation} requires an exact item id.").into());
     }
 
+    if let Some(calendar_sync) = arguments.calendar_sync {
+        if kind != ItemKind::Reminder {
+            return Err("calendar_sync is only supported for reminders.".into());
+        }
+        let _ = calendar_sync;
+    }
+
     if matches!(operation.as_str(), "complete" | "cancel" | "trigger")
         && (arguments.title.is_some()
             || arguments.body.is_some()
             || arguments.due.is_some()
-            || arguments.status.is_some())
+            || arguments.status.is_some()
+            || arguments.calendar_sync.is_some())
     {
         return Err(format!("{operation} only accepts operation and id.").into());
     }
@@ -1132,8 +1360,11 @@ fn validate_mutation_shape(kind: ItemKind, arguments: &MutationArguments) -> Res
         && arguments.body.is_none()
         && arguments.due.is_none()
         && arguments.status.is_none()
+        && arguments.calendar_sync.is_none()
     {
-        return Err("update requires at least one of title, body, due, or status.".into());
+        return Err(
+            "update requires at least one of title, body, due, status, or calendar_sync.".into(),
+        );
     }
 
     Ok(())
@@ -1144,6 +1375,7 @@ fn mutate_item(
     db: &SqliteMemoryDb,
     kind: ItemKind,
     arguments: MutationArguments,
+    calendar_sync: Option<&ReminderCalendarSync>,
 ) -> Result<ToolResult> {
     validate_mutation_shape(kind, &arguments)?;
     let operation = arguments.operation.trim().to_ascii_lowercase();
@@ -1166,6 +1398,8 @@ fn mutate_item(
         let path = path_for(root, kind, &note_id);
         fs::create_dir_all(path.parent().ok_or("Task/reminder path has no parent.")?)?;
         let created_at = now_timestamp()?;
+        let calendar_sync_enabled =
+            kind == ItemKind::Reminder && arguments.calendar_sync.unwrap_or(false);
         let content = render_new_note(
             kind,
             &note_id,
@@ -1174,6 +1408,8 @@ fn mutate_item(
             status,
             due_at.as_deref(),
             &created_at,
+            calendar_sync_enabled,
+            calendar_sync.map(|sync| sync.calendar_id()),
         );
 
         if path.exists() {
@@ -1191,6 +1427,19 @@ fn mutate_item(
                 && parsed.metadata.due_at.as_deref() == due_at.as_deref()
                 && body_matches_requested(&parsed.body, body);
             if same_semantics {
+                if kind == ItemKind::Reminder && calendar_sync_enabled {
+                    if let Some(sync) = calendar_sync {
+                        // An idempotent create must not create a second Google event
+                        // when the reminder already has one. Reuse the update path,
+                        // which creates an event only when no event ID exists.
+                        sync_updated_reminder(&path, sync, title, body, due_at.as_deref())?;
+                    }
+                }
+                let sync_metadata = if kind == ItemKind::Reminder {
+                    Some(read_calendar_sync_metadata(&path)?)
+                } else {
+                    None
+                };
                 return Ok(ToolResult {
                     success: true,
                     output: serde_json::json!({
@@ -1204,6 +1453,10 @@ fn mutate_item(
                         "due_at": due_at,
                         "due_at_local": due_at.as_deref().map(format_local).transpose()?,
                         "timezone_offset": offset_display(local_offset()?),
+                        "calendar_sync_enabled": sync_metadata.as_ref().map(|m| m.enabled),
+                        "calendar_sync_status": sync_metadata.as_ref().and_then(|m| m.status.clone()),
+                        "calendar_sync_error": sync_metadata.as_ref().and_then(|m| m.error.clone()),
+                        "google_event_id": sync_metadata.as_ref().and_then(|m| m.event_id.clone()),
                     }),
                 });
             }
@@ -1213,6 +1466,18 @@ fn mutate_item(
         if !create_new_file(&path, &content)? {
             return Err("Task/reminder was created concurrently; retry the request.".into());
         }
+
+        if kind == ItemKind::Reminder && calendar_sync_enabled {
+            if let Some(sync) = calendar_sync {
+                sync_created_reminder(&path, sync, title, body, due_at.as_deref())?;
+            }
+        }
+
+        let sync_metadata = if kind == ItemKind::Reminder {
+            Some(read_calendar_sync_metadata(&path)?)
+        } else {
+            None
+        };
 
         return Ok(ToolResult {
             success: true,
@@ -1226,6 +1491,10 @@ fn mutate_item(
                 "due_at": due_at,
                 "due_at_local": due_at.as_deref().map(format_local).transpose()?,
                 "timezone_offset": offset_display(local_offset()?),
+                "calendar_sync_enabled": sync_metadata.as_ref().map(|m| m.enabled),
+                "calendar_sync_status": sync_metadata.as_ref().and_then(|m| m.status.clone()),
+                "calendar_sync_error": sync_metadata.as_ref().and_then(|m| m.error.clone()),
+                "google_event_id": sync_metadata.as_ref().and_then(|m| m.event_id.clone()),
             }),
         });
     }
@@ -1323,6 +1592,15 @@ fn mutate_item(
         .body
         .clone()
         .unwrap_or_else(|| _current_body.clone());
+    let calendar_metadata = if kind == ItemKind::Reminder {
+        Some(read_calendar_sync_metadata(&path)?)
+    } else {
+        None
+    };
+    let resulting_calendar_sync_enabled = arguments
+        .calendar_sync
+        .or_else(|| calendar_metadata.as_ref().map(|metadata| metadata.enabled))
+        .unwrap_or(false);
 
     mutate_markdown(
         kind,
@@ -1338,6 +1616,51 @@ fn mutate_item(
         new_due.as_ref().map(|value| value.as_deref()),
     )?;
 
+    if kind == ItemKind::Reminder {
+        if let Some(sync) = calendar_sync {
+            let mut next_metadata = calendar_metadata.clone().unwrap_or_default();
+            if let Some(requested) = arguments.calendar_sync {
+                next_metadata.enabled = requested;
+                next_metadata.calendar_id = next_metadata
+                    .calendar_id
+                    .or_else(|| Some(sync.calendar_id().to_string()));
+                next_metadata.error = None;
+                next_metadata.status = Some(if requested {
+                    "pending".to_string()
+                } else if next_metadata.event_id.is_some() {
+                    "preserved".to_string()
+                } else {
+                    "disabled".to_string()
+                });
+                persist_calendar_sync_metadata(&path, &next_metadata)?;
+            }
+
+            if resulting_calendar_sync_enabled {
+                match operation.as_str() {
+                    "update" => {
+                        sync_updated_reminder(
+                            &path,
+                            sync,
+                            &resulting_title,
+                            &resulting_body,
+                            resulting_due_at.as_deref(),
+                        )?;
+                    }
+                    "cancel" => {
+                        sync_cancelled_reminder(&path)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let sync_metadata = if kind == ItemKind::Reminder {
+        Some(read_calendar_sync_metadata(&path)?)
+    } else {
+        None
+    };
+
     Ok(ToolResult {
         success: true,
         output: serde_json::json!({
@@ -1352,6 +1675,10 @@ fn mutate_item(
             "due_at": resulting_due_at,
             "due_at_local": resulting_due_at.as_deref().map(format_local).transpose()?,
             "timezone_offset": offset_display(local_offset()?),
+            "calendar_sync_enabled": sync_metadata.as_ref().map(|m| m.enabled),
+            "calendar_sync_status": sync_metadata.as_ref().and_then(|m| m.status.clone()),
+            "calendar_sync_error": sync_metadata.as_ref().and_then(|m| m.error.clone()),
+            "google_event_id": sync_metadata.as_ref().and_then(|m| m.event_id.clone()),
         }),
     })
 }
@@ -1410,7 +1737,7 @@ impl Tool for TaskMutationTool {
 
     fn execute(&self, arguments: &Value) -> Result<ToolResult> {
         let parsed: MutationArguments = serde_json::from_value(arguments.clone())?;
-        mutate_item(&self.root, &self.db, ItemKind::Task, parsed)
+        mutate_item(&self.root, &self.db, ItemKind::Task, parsed, None)
     }
 }
 
@@ -1444,6 +1771,7 @@ impl Tool for ReminderListTool {
 pub struct ReminderMutationTool {
     root: PathBuf,
     db: SqliteMemoryDb,
+    calendar_sync: ReminderCalendarSync,
 }
 
 impl ReminderMutationTool {
@@ -1453,6 +1781,22 @@ impl ReminderMutationTool {
         Ok(Self {
             root: root.as_ref().to_path_buf(),
             db,
+            calendar_sync: ReminderCalendarSync::from_env()?,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_calendar_sync(
+        root: impl AsRef<Path>,
+        db_path: impl AsRef<Path>,
+        calendar_sync: ReminderCalendarSync,
+    ) -> Result<Self> {
+        let db = SqliteMemoryDb::open(db_path)?;
+        db.initialize_schema()?;
+        Ok(Self {
+            root: root.as_ref().to_path_buf(),
+            db,
+            calendar_sync,
         })
     }
 }
@@ -1468,13 +1812,70 @@ impl Tool for ReminderMutationTool {
 
     fn execute(&self, arguments: &Value) -> Result<ToolResult> {
         let parsed: MutationArguments = serde_json::from_value(arguments.clone())?;
-        mutate_item(&self.root, &self.db, ItemKind::Reminder, parsed)
+        mutate_item(
+            &self.root,
+            &self.db,
+            ItemKind::Reminder,
+            parsed,
+            Some(&self.calendar_sync),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn start_calendar_create_server() -> Result<(String, thread::JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("calendar request expected");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+
+            loop {
+                let read = stream.read(&mut buffer).expect("request read failed");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length:")
+                                .or_else(|| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let header_length = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .expect("header terminator missing")
+                        + 4;
+                    if request.len() >= header_length + content_length {
+                        break;
+                    }
+                }
+            }
+
+            let body = r#"{"id":"event-123","summary":"Call Mom","start":{"dateTime":"2026-09-23T10:00:00Z"},"end":{"dateTime":"2026-09-23T10:30:00Z"}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("response write failed");
+        });
+        Ok((format!("http://{address}/calendar/v3"), handle))
+    }
 
     fn database() -> Result<(tempfile::TempDir, PathBuf, SqliteMemoryDb)> {
         let temp = tempfile::tempdir()?;
@@ -1544,6 +1945,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_dd_mm_yy_hyphen_with_time() -> Result<()> {
+        let now = OffsetDateTime::parse("2026-09-23T10:00:00Z", &Rfc3339)?;
+        let due = parse_due_expression("24-09-26 19:00", now)?;
+        let local = OffsetDateTime::parse(&due, &Rfc3339)?.to_offset(local_offset()?);
+        assert_eq!(local.date().year(), 2026);
+        assert_eq!(local.date().month(), Month::September);
+        assert_eq!(local.date().day(), 24);
+        assert_eq!(local.time().hour(), 19);
+        assert_eq!(local.time().minute(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn dd_mm_yyyy_defaults_to_nine_am() -> Result<()> {
         let now = OffsetDateTime::parse("2026-09-13T10:00:00Z", &Rfc3339)?;
         let due = parse_due_expression("24/09/2026", now)?;
@@ -1559,6 +1973,25 @@ mod tests {
         let now = OffsetDateTime::parse("2026-09-13T10:00:00Z", &Rfc3339)?;
         let due = parse_due_expression("in 2 hours", now)?;
         assert_eq!(due, "2026-09-13T12:00:00Z");
+        Ok(())
+    }
+
+    #[test]
+    fn parses_relative_duration_with_articles() -> Result<()> {
+        let now = OffsetDateTime::parse("2026-09-23T10:00:00Z", &Rfc3339)?;
+
+        assert_eq!(
+            parse_due_expression("in an hour", now)?,
+            "2026-09-23T11:00:00Z"
+        );
+        assert_eq!(
+            parse_due_expression("in a day", now)?,
+            "2026-09-24T10:00:00Z"
+        );
+        assert_eq!(
+            parse_due_expression("in half an hour", now)?,
+            "2026-09-23T10:30:00Z"
+        );
         Ok(())
     }
 
@@ -1759,6 +2192,262 @@ Review RCM data.
 
         assert_eq!(result.output["count"], 1);
         assert_eq!(result.output["items"][0]["title"], "Submit the application");
+        Ok(())
+    }
+
+    #[test]
+    fn reminder_create_syncs_calendar_event_and_persists_metadata() -> Result<()> {
+        let (temp, root, _db) = database()?;
+        let (base_url, server) = start_calendar_create_server()?;
+        let client =
+            crate::GoogleCalendarClient::with_base_url("test-token", "primary", &base_url)?;
+        let tool = ReminderMutationTool::with_calendar_sync(
+            &root,
+            temp.path().join("assistant.db"),
+            ReminderCalendarSync::for_test(client, "primary"),
+        )?;
+        let created = tool.execute(&serde_json::json!({
+            "operation": "create",
+            "title": "Call Mom",
+            "due": "2026-09-23T10:00:00Z",
+            "calendar_sync": true
+        }))?;
+
+        let relative_path = created.output["path"].as_str().unwrap();
+        let note = fs::read_to_string(root.join(relative_path))?;
+        let parsed = parse_markdown(&note);
+        assert_eq!(parsed.metadata.calendar_sync_enabled, Some(true));
+        assert_eq!(
+            parsed.metadata.google_calendar_id.as_deref(),
+            Some("primary")
+        );
+        assert_eq!(
+            parsed.metadata.google_event_id.as_deref(),
+            Some("event-123")
+        );
+        assert_eq!(
+            parsed.metadata.calendar_sync_status.as_deref(),
+            Some("synced")
+        );
+        assert!(parsed.metadata.calendar_last_synced_at.is_some());
+        assert_eq!(parsed.metadata.calendar_sync_error.as_deref(), None);
+        assert_eq!(created.output["calendar_sync_enabled"], true);
+        assert_eq!(created.output["calendar_sync_status"], "synced");
+        assert_eq!(created.output["google_event_id"], "event-123");
+
+        server.join().expect("calendar mock server panicked");
+        Ok(())
+    }
+
+    fn start_calendar_create_then_update_server() -> Result<(String, thread::JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let handle = thread::spawn(move || {
+            for (index, (expected_method, expected_path, response_body)) in [
+                (
+                    "POST",
+                    "/calendar/v3/calendars/primary/events?sendUpdates=none",
+                    r#"{"id":"event-123","summary":"Call Mom"}"#,
+                ),
+                (
+                    "PATCH",
+                    "/calendar/v3/calendars/primary/events/event-123?sendUpdates=none",
+                    r#"{"id":"event-123","summary":"Call Mom"}"#,
+                ),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let (mut stream, _) = listener.accept().expect("calendar request expected");
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).expect("request read failed");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("Content-Length:")
+                                    .or_else(|| line.strip_prefix("content-length:"))
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        let header_length = request
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .expect("header terminator missing")
+                            + 4;
+                        if request.len() >= header_length + content_length {
+                            break;
+                        }
+                    }
+                }
+
+                let first_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(
+                    first_line.starts_with(&format!("{expected_method} {expected_path} ")),
+                    "request {} had unexpected line: {first_line}",
+                    index + 1
+                );
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("response write failed");
+            }
+        });
+        Ok((format!("http://{address}/calendar/v3"), handle))
+    }
+
+    #[test]
+    fn reminder_idempotent_create_updates_existing_calendar_event() -> Result<()> {
+        let (temp, root, _db) = database()?;
+        let (base_url, server) = start_calendar_create_then_update_server()?;
+        let client =
+            crate::GoogleCalendarClient::with_base_url("test-token", "primary", &base_url)?;
+        let tool = ReminderMutationTool::with_calendar_sync(
+            &root,
+            temp.path().join("assistant.db"),
+            ReminderCalendarSync::for_test(client, "primary"),
+        )?;
+
+        let arguments = serde_json::json!({
+            "operation": "create",
+            "title": "Call Mom",
+            "due": "2026-09-23T10:00:00Z",
+            "calendar_sync": true
+        });
+        let first = tool.execute(&arguments)?;
+        assert_eq!(first.output["google_event_id"], "event-123");
+
+        let second = tool.execute(&arguments)?;
+        assert_eq!(second.output["google_event_id"], "event-123");
+        assert_eq!(second.output["calendar_sync_status"], "synced");
+
+        server.join().expect("calendar mock server panicked");
+        Ok(())
+    }
+
+    #[test]
+    fn reminder_create_without_calendar_sync_stays_local_only() -> Result<()> {
+        let (temp, root, _db) = database()?;
+        let client = crate::GoogleCalendarClient::with_base_url(
+            "test-token",
+            "primary",
+            "http://127.0.0.1:9/calendar/v3",
+        )?;
+        let tool = ReminderMutationTool::with_calendar_sync(
+            &root,
+            temp.path().join("assistant.db"),
+            ReminderCalendarSync::for_test(client, "primary"),
+        )?;
+
+        let created = tool.execute(&serde_json::json!({
+            "operation": "create",
+            "title": "Local only",
+            "due": "2026-09-23T10:00:00Z"
+        }))?;
+
+        let relative_path = created.output["path"].as_str().unwrap();
+        let parsed = parse_markdown(&fs::read_to_string(root.join(relative_path))?);
+        assert_eq!(parsed.metadata.calendar_sync_enabled, Some(false));
+        assert_eq!(
+            parsed.metadata.calendar_sync_status.as_deref(),
+            Some("disabled")
+        );
+        assert_eq!(parsed.metadata.google_event_id, None);
+        assert_eq!(created.output["calendar_sync_enabled"], false);
+        assert_eq!(created.output["calendar_sync_status"], "disabled");
+        Ok(())
+    }
+
+    #[test]
+    fn reminder_calendar_event_is_preserved_on_local_cancel_and_due_clear() -> Result<()> {
+        let (temp, root, mut db) = database()?;
+        let create_tool = ReminderMutationTool::new(&root, temp.path().join("assistant.db"))?;
+        let created = create_tool.execute(&serde_json::json!({
+            "operation": "create",
+            "title": "Preserve calendar event",
+            "due": "2026-09-23T10:00:00Z"
+        }))?;
+
+        let relative_path = created.output["path"].as_str().unwrap();
+        let path = root.join(relative_path);
+        let mut content = fs::read_to_string(&path)?;
+        content = set_top_level_field(&content, "calendar_sync_enabled", Some("true"))?;
+        content = set_top_level_field(&content, "google_calendar_id", Some("primary"))?;
+        content = set_top_level_field(&content, "google_event_id", Some("event-preserve"))?;
+        content = set_top_level_field(&content, "calendar_sync_status", Some("synced"))?;
+        fs::write(&path, content)?;
+        refresh(&root, &mut db)?;
+        // The mutation tool opens a fresh SQLite connection. Drop the refresh
+        // connection before opening it so this test cannot retain a stale
+        // SQLite snapshot while validating Markdown/index consistency.
+        drop(db);
+
+        let client = crate::GoogleCalendarClient::with_base_url(
+            "test-token",
+            "primary",
+            "http://127.0.0.1:9/calendar/v3",
+        )?;
+        let tool = ReminderMutationTool::with_calendar_sync(
+            &root,
+            temp.path().join("assistant.db"),
+            ReminderCalendarSync::for_test(client, "primary"),
+        )?;
+
+        tool.execute(&serde_json::json!({
+            "operation": "update",
+            "id": created.output["id"].as_str().unwrap(),
+            "due": null
+        }))?;
+
+        // Mutations are deliberately followed by an explicit index refresh in
+        // this test so a second mutation observes the authoritative Markdown
+        // state rather than the mutation tool's pre-update SQLite snapshot.
+        let mut refreshed_db = SqliteMemoryDb::open(temp.path().join("assistant.db"))?;
+        refresh(&root, &mut refreshed_db)?;
+        drop(refreshed_db);
+
+        let content = fs::read_to_string(&path)?;
+        let parsed = parse_markdown(&content);
+        assert_eq!(
+            parsed.metadata.google_event_id.as_deref(),
+            Some("event-preserve")
+        );
+        assert_eq!(
+            parsed.metadata.calendar_sync_status.as_deref(),
+            Some("preserved")
+        );
+
+        tool.execute(&serde_json::json!({
+            "operation": "cancel",
+            "id": created.output["id"].as_str().unwrap()
+        }))?;
+
+        let content = fs::read_to_string(&path)?;
+        let parsed = parse_markdown(&content);
+        assert_eq!(
+            parsed.metadata.google_event_id.as_deref(),
+            Some("event-preserve")
+        );
+        assert_eq!(
+            parsed.metadata.calendar_sync_status.as_deref(),
+            Some("preserved")
+        );
         Ok(())
     }
 

@@ -13,5 +13,6 @@ sha2 = "0.10"
 indexer = { path = "../indexer" }
 sqlite-memory = { path = "../sqlite-memory" }
 time = { version = "0.3", features = ["formatting", "local-offset", "parsing"] }
+libc = "0.2"
 
 tempfile = "3"
