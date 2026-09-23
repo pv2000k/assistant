@@ -2867,11 +2867,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(true);
 
     let mut background_workers = if background_workers_enabled {
-        match sqlite_ingest::BackgroundWorkers::start_with_shared_model(
+        match sqlite_ingest::BackgroundWorkers::start_with_shared_model_and_indexer(
             &memory_root,
             &db_path,
             qwen_url.clone(),
             Arc::clone(&qwen_model_state),
+            Some(indexer.clone()),
         ) {
             Ok(workers) => {
                 println!("Background workers: memory extraction + reminder scheduler enabled.");

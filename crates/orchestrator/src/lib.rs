@@ -3,9 +3,10 @@ use serde::{Deserialize, Serialize};
 pub const MAX_ORCHESTRATION_STEPS: usize = 8;
 pub const MAX_ACTIONS_PER_PLAN: usize = 4;
 
-const MAX_CONTROLLER_REQUEST_CHARS: usize = 4000;
-const MAX_CONTROLLER_HISTORY_CHARS: usize = 5000;
-const MAX_CONTROLLER_TRACE_CHARS: usize = 6500;
+const MAX_CONTROLLER_REQUEST_CHARS: usize = 1800;
+const MAX_CONTROLLER_HISTORY_CHARS: usize = 1000;
+const MAX_CONTROLLER_TRACE_CHARS: usize = 1200;
+const MAX_CONTROLLER_USER_CONTENT_CHARS: usize = 4200;
 const MAX_MEMORY_RESULT_TEXT_CHARS: usize = 1600;
 const MAX_GRAPH_ENTITIES: usize = 8;
 const MAX_GRAPH_RELATIONSHIPS: usize = 8;
@@ -395,6 +396,43 @@ fn memory_result_subject_matches(query: &MemoryQuery, result: &MemoryResult) -> 
         .map_or(0.5, |matched| if matched { 1.0 } else { 0.0 })
 }
 
+fn memory_query_term_overlap(query: &str, text: &str) -> f64 {
+    const STOP_WORDS: &[&str] = &[
+        "a", "an", "and", "are", "am", "about", "be", "do", "does", "for", "how", "i", "is", "it",
+        "me", "my", "of", "the", "to", "was", "what", "where", "who", "why", "with", "you", "your",
+    ];
+
+    let tokenize = |value: &str| {
+        value
+            .split_whitespace()
+            .map(|word| {
+                word.chars()
+                    .filter(|character| character.is_alphanumeric() || *character == '_')
+                    .flat_map(|character| character.to_lowercase())
+                    .collect::<String>()
+            })
+            .filter(|token| token.len() >= 3 && !STOP_WORDS.contains(&token.as_str()))
+            .map(|token| match token.as_str() {
+                "favourite" => "favorite".to_string(),
+                other => other.to_string(),
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    let query_terms = tokenize(query);
+    if query_terms.is_empty() {
+        return 0.0;
+    }
+
+    let text_terms = tokenize(text);
+    let matched = query_terms
+        .iter()
+        .filter(|term| text_terms.contains(*term))
+        .count();
+
+    matched as f64 / query_terms.len() as f64
+}
+
 fn memory_result_retrieval_quality(result: &MemoryResult, rank: usize) -> f64 {
     let Some(breakdown) = result.score_breakdown.as_ref() else {
         return (0.5 / (rank as f64 + 1.0)).clamp(0.0, 1.0);
@@ -409,7 +447,8 @@ fn memory_result_base_score(
     result: &MemoryResult,
     rank: usize,
 ) -> MemoryEvidenceScore {
-    let retrieval_quality = memory_result_retrieval_quality(result, rank);
+    let retrieval_quality = memory_result_retrieval_quality(result, rank)
+        .max(memory_query_term_overlap(&query.query, &result.text));
     let graph_support = result
         .score_breakdown
         .as_ref()
@@ -436,6 +475,24 @@ fn memory_result_base_score(
         scope_fit,
         uniqueness: 0.0,
     }
+}
+
+fn is_personal_memory_query(query: &MemoryQuery) -> bool {
+    let normalized = query.query.to_ascii_lowercase();
+    [
+        "name",
+        "alias",
+        "nickname",
+        "preferred",
+        "favorite",
+        "favourite",
+        "identity",
+        "call me",
+        "user",
+        "preference",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 fn assess_memory_query<'a>(
@@ -488,7 +545,12 @@ fn assess_memory_query<'a>(
         candidate.score.uniqueness = uniqueness;
     }
 
-    let decision = if candidates.len() == 1 {
+    let top_textual_overlap = memory_query_term_overlap(&query.query, &candidates[0].result.text);
+    let direct_personal_match = is_personal_memory_query(query) && top_textual_overlap >= 0.66;
+
+    let decision = if direct_personal_match {
+        MemoryEvidenceDecision::Proceed
+    } else if candidates.len() == 1 {
         if candidates[0].score.total() >= MEMORY_EVIDENCE_SINGLE_RESULT_THRESHOLD {
             MemoryEvidenceDecision::Proceed
         } else {
@@ -632,7 +694,7 @@ fn memory_clarification(query: &MemoryQuery, results: &[MemoryResult]) -> Option
     Some(message)
 }
 
-fn is_explicit_memory_write_request(text: &str) -> bool {
+pub fn is_explicit_memory_write_request(text: &str) -> bool {
     let normalized = text.trim().to_ascii_lowercase();
 
     if normalized.is_empty() {
@@ -642,32 +704,51 @@ fn is_explicit_memory_write_request(text: &str) -> bool {
     let write_prefixes = [
         "remember that ",
         "remember this",
+        "remember it",
         "please remember that ",
         "please remember this",
+        "please remember it",
         "save this",
         "save that",
+        "save it",
         "save the fact",
         "store this",
         "store that",
+        "store it",
         "store the fact",
         "write this to memory",
         "write that to memory",
         "add this to memory",
         "add that to memory",
+        "add it to memory",
         "make a note of ",
         "memorize this",
+        "memorize it",
         "memorise this",
+        "memorise it",
+        "please save this",
+        "please save that",
+        "please save it",
         "please save this to memory",
         "please save that to memory",
+        "please save it to memory",
         "save this to memory",
         "save that to memory",
+        "save it to memory",
         "write memory",
         "save memory",
     ];
 
-    write_prefixes
-        .iter()
-        .any(|prefix| normalized.starts_with(prefix))
+    normalized
+        .split(['.', '!', '?', ',', ';', ':', '\n'])
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .any(|clause| {
+            write_prefixes.iter().any(|prefix| {
+                let phrase = prefix.trim_end();
+                clause == phrase || clause.starts_with(prefix)
+            })
+        })
 }
 
 fn validate_memory_write_policy(
@@ -1592,6 +1673,26 @@ impl LlamaCppController {
         Some((tool, serde_json::Value::Object(arguments)))
     }
 
+    fn normalize_due_expression(value: &str) -> String {
+        let cleaned = Self::clean_task_reminder_text(value);
+        let words = cleaned.split_whitespace().collect::<Vec<_>>();
+
+        for time_len in [2usize, 1usize] {
+            if words.len() <= time_len {
+                continue;
+            }
+            let time = words[..time_len].join(" ");
+            let date = words[time_len..].join(" ");
+            if tools::tasks::is_due_expression(&format!("at {time}"))
+                && tools::tasks::is_due_expression(&date)
+            {
+                return format!("{date} at {time}");
+            }
+        }
+
+        cleaned
+    }
+
     fn parse_task_reminder_pending_mutation(
         text: &str,
     ) -> Option<(&'static str, &'static str, String, Option<String>)> {
@@ -1609,11 +1710,48 @@ impl LlamaCppController {
             "cancel"
         } else if lower.contains("complete") || lower.contains("done") {
             "complete"
-        } else if lower.starts_with("move ") || lower.contains(" move ") {
+        } else if lower.starts_with("edit ")
+            || lower.starts_with("change ")
+            || lower.starts_with("update ")
+            || lower.starts_with("move ")
+        {
             "update"
         } else {
             return None;
         };
+
+        if operation == "update" && kind == "reminder" {
+            for marker in [" reminder to ", " reminder at "] {
+                if let Some(marker_index) = lower.find(marker) {
+                    let prefix = cleaned[..marker_index].trim();
+                    let query = [
+                        "edit the ",
+                        "change the ",
+                        "update the ",
+                        "move the ",
+                        "edit ",
+                        "change ",
+                        "update ",
+                        "move ",
+                    ]
+                    .iter()
+                    .find_map(|marker| Self::strip_prefix_case_insensitive(prefix, marker))
+                    .unwrap_or(prefix)
+                    .trim();
+                    let query = Self::unquote_task_reminder_text(query);
+                    let candidate = cleaned[marker_index + marker.len()..].trim();
+                    let due = if candidate.is_empty() {
+                        None
+                    } else {
+                        let normalized = Self::normalize_due_expression(candidate);
+                        tools::tasks::is_due_expression(&normalized).then_some(normalized)
+                    };
+                    if !query.is_empty() && due.is_some() {
+                        return Some(("reminders.list", "update", query.to_string(), due));
+                    }
+                }
+            }
+        }
 
         let marker = if lower.contains("called ") {
             "called "
@@ -1649,11 +1787,11 @@ impl LlamaCppController {
             let move_lower = tail_lower;
             let to_index = move_lower.find(" to ")?;
             query = tail[..to_index].trim().to_string();
-            let candidate = tail[to_index + 4..].trim();
-            if candidate.is_empty() || !tools::tasks::is_due_expression(candidate) {
+            let candidate = Self::normalize_due_expression(tail[to_index + 4..].trim());
+            if candidate.is_empty() || !tools::tasks::is_due_expression(&candidate) {
                 return None;
             }
-            due = Some(candidate.to_string());
+            due = Some(candidate);
         }
 
         if query.is_empty() {
@@ -1665,6 +1803,55 @@ impl LlamaCppController {
         } else {
             "reminders.list"
         };
+        Some((tool, operation, query, due))
+    }
+
+    fn clarification_task_reminder_target(
+        text: &str,
+        history: &str,
+    ) -> Option<(&'static str, &'static str, String, Option<String>)> {
+        let response = Self::clean_task_reminder_text(text);
+        if response.is_empty() {
+            return None;
+        }
+
+        let assistant_marker = "ASSISTANT:\n";
+        let assistant_start = history.rfind(assistant_marker)? + assistant_marker.len();
+        let assistant = Self::clean_task_reminder_text(&history[assistant_start..]);
+        let assistant_lower = assistant.to_ascii_lowercase();
+        let clarification_detected = assistant_lower.contains("which one should i change")
+            && assistant_lower.starts_with("i found multiple active ");
+        if !clarification_detected {
+            return None;
+        }
+
+        let history_before_assistant = &history[..assistant_start - assistant_marker.len()];
+        let user_start = history_before_assistant.rfind("USER:\n")?;
+        let user_before_assistant = &history_before_assistant[user_start + "USER:\n".len()..];
+        let original_request = user_before_assistant
+            .split("\n\nASSISTANT:\n")
+            .next()?
+            .trim();
+        let (_, operation, _query, due) =
+            Self::parse_task_reminder_pending_mutation(original_request)?;
+
+        let query = ["the exact title is ", "exact title: ", "it is "]
+            .iter()
+            .find_map(|prefix| Self::strip_prefix_case_insensitive(&response, prefix))
+            .unwrap_or(&response);
+        let query = Self::unquote_task_reminder_text(query);
+        if query.is_empty() {
+            return None;
+        }
+
+        let tool = if assistant_lower.contains("multiple active task matches") {
+            "tasks.list"
+        } else if assistant_lower.contains("multiple active reminder matches") {
+            "reminders.list"
+        } else {
+            return None;
+        };
+
         Some((tool, operation, query, due))
     }
 
@@ -1861,8 +2048,93 @@ impl LlamaCppController {
         None
     }
 
+    fn recent_user_message_from_history(history: &str) -> Option<String> {
+        let user_start = history.rfind("USER:\n")? + "USER:\n".len();
+        let user_block = &history[user_start..];
+        let assistant_marker = "\n\nASSISTANT:\n";
+        let assistant_start = user_block.find(assistant_marker)?;
+        let user_text = user_block[..assistant_start].trim();
+        (!user_text.is_empty()).then(|| user_text.to_string())
+    }
+
+    fn deterministic_personal_memory_plan(context: &ControllerContext) -> Option<QueryPlan> {
+        if !context.observations.is_empty() {
+            return None;
+        }
+
+        let normalized = context
+            .request
+            .text
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|character| character.is_alphanumeric() || character.is_whitespace())
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let query = match normalized.as_str() {
+            "who am i" => "name".to_string(),
+            "what is my name" | "whats my name" => "name alias".to_string(),
+            "what should you call me" | "what do you call me" => "name alias".to_string(),
+            "what is my favorite project" | "what is my favourite project" => {
+                "favorite project".to_string()
+            }
+            "what do you remember about me" | "what do you know about me" => {
+                "user identity preferences".to_string()
+            }
+            "yes" | "yeah" | "yep" | "correct" | "thats it" | "that is it" => {
+                if !context
+                    .history
+                    .to_ascii_lowercase()
+                    .contains("i found a possible match")
+                    && !context
+                        .history
+                        .to_ascii_lowercase()
+                        .contains("i found multiple plausible memories")
+                {
+                    return None;
+                }
+
+                let previous_request = Self::recent_user_message_from_history(&context.history)?;
+                previous_request
+            }
+            _ => return None,
+        };
+
+        Some(QueryPlan {
+            reasoning_summary: "Search persistent memory for the user's personal information."
+                .to_string(),
+            intent: QueryIntent::RetrieveMemory {
+                query,
+                limit: 5,
+                subject: None,
+                time: None,
+                mode: MemoryIntentMode::Unspecified,
+            },
+        })
+    }
+
     fn deterministic_task_reminder_plan(context: &ControllerContext) -> Option<QueryPlan> {
         if context.observations.is_empty() {
+            if let Some((tool, _operation, query, _due)) =
+                Self::clarification_task_reminder_target(&context.request.text, &context.history)
+            {
+                return Some(QueryPlan {
+                    reasoning_summary:
+                        "Resolve the reminder selected by the user's clarification response."
+                            .to_string(),
+                    intent: QueryIntent::CallTool {
+                        tool: tool.to_string(),
+                        arguments: serde_json::json!({
+                            "query": query,
+                            "limit": 20
+                        }),
+                    },
+                });
+            }
+
             let (create_request, calendar_sync_requested) =
                 Self::strip_calendar_sync_suffix(&context.request.text);
             if let Some((tool, title, due)) = Self::parse_task_reminder_create(&create_request) {
@@ -1949,6 +2221,83 @@ impl LlamaCppController {
         }
 
         let last = context.observations.last()?;
+
+        if let Some((tool, operation, query, due)) =
+            Self::clarification_task_reminder_target(&context.request.text, &context.history)
+        {
+            if !matches!(
+                &last.action,
+                ControllerAction::CallTool { tool: previous_tool, .. }
+                    if previous_tool == tool
+            ) {
+                return None;
+            }
+
+            let ActionResult::Tool { result } = &last.result else {
+                return None;
+            };
+            if !result.success {
+                return None;
+            }
+            let items = result.output.get("items")?.as_array()?;
+            if items.is_empty() {
+                return Some(QueryPlan {
+                    reasoning_summary: "No task/reminder matched the clarification title."
+                        .to_string(),
+                    intent: QueryIntent::Respond {
+                        text: format!(
+                            "I couldn't find an active {} matching '{}'.",
+                            if tool == "tasks.list" {
+                                "task"
+                            } else {
+                                "reminder"
+                            },
+                            query
+                        ),
+                    },
+                });
+            }
+            if items.len() != 1 {
+                return Some(QueryPlan {
+                    reasoning_summary:
+                        "The clarification title still matches multiple active items.".to_string(),
+                    intent: QueryIntent::Clarify {
+                        question: format!(
+                            "I still found multiple active {} matches for '{}'. Which one should I change?",
+                            if tool == "tasks.list" {
+                                "task"
+                            } else {
+                                "reminder"
+                            },
+                            query
+                        ),
+                    },
+                });
+            }
+
+            let id = items[0].get("id")?.as_str()?;
+            let mutate_tool = if tool == "tasks.list" {
+                "tasks.mutate"
+            } else {
+                "reminders.mutate"
+            };
+            let mut arguments = serde_json::json!({
+                "operation": operation,
+                "id": id
+            });
+            if let Some(due) = due {
+                arguments["due"] = serde_json::json!(due);
+            }
+
+            return Some(QueryPlan {
+                reasoning_summary: "The clarification title resolved to one active task/reminder."
+                    .to_string(),
+                intent: QueryIntent::CallTool {
+                    tool: mutate_tool.to_string(),
+                    arguments,
+                },
+            });
+        }
 
         if let Some(query) =
             Self::calendar_sync_target_query(&context.request.text, &context.history)
@@ -2308,6 +2657,12 @@ Context rules:
             if output.chars().count() + separator_len + serialized.chars().count()
                 > MAX_CONTROLLER_TRACE_CHARS
             {
+                if output.is_empty() {
+                    output.push_str(&Self::truncate_chars(
+                        &serialized,
+                        MAX_CONTROLLER_TRACE_CHARS,
+                    ));
+                }
                 break;
             }
 
@@ -2389,6 +2744,10 @@ Context rules:
             user_content.push_str(&trace);
         }
 
+        if user_content.chars().count() > MAX_CONTROLLER_USER_CONTENT_CHARS {
+            user_content = Self::truncate_chars(&user_content, MAX_CONTROLLER_USER_CONTENT_CHARS);
+        }
+
         serde_json::json!({
             "model": self.model,
             "temperature": 0,
@@ -2403,9 +2762,8 @@ Context rules:
                 {
                     "role": "user",
                     "content": format!(
-                        "{}\n\nOUTPUT SCHEMA:\n{}\n\nReturn ONLY the JSON object. No explanation. No analysis. No extra keys.",
-                        user_content,
-                        serde_json::to_string(&schema).unwrap_or_else(|_| "{}".to_string())
+                        "{}\n\nReturn ONLY the JSON object matching the supplied response schema. No explanation. No analysis. No extra keys.",
+                        user_content
                     )
                 }
             ],
@@ -3533,6 +3891,10 @@ impl QueryPlanner for LlamaCppController {
         &self,
         context: &ControllerContext,
     ) -> Result<QueryPlan, Box<dyn std::error::Error>> {
+        if let Some(plan) = Self::deterministic_personal_memory_plan(context) {
+            return Ok(plan);
+        }
+
         if let Some(plan) = Self::deterministic_task_reminder_plan(context) {
             return Ok(plan);
         }
@@ -3553,7 +3915,10 @@ impl QueryPlanner for LlamaCppController {
             return Err(format!("llama.cpp returned HTTP {}: {}", status, body).into());
         }
 
-        let response: ChatCompletionResponse = serde_json::from_str(&body)?;
+        let response: ChatCompletionResponse = serde_json::from_str(&body).map_err(|error| {
+            let preview = Self::truncate_chars(&body, 2000);
+            format!("llama.cpp returned invalid JSON: {error}; response preview: {preview}")
+        })?;
 
         let content = response
             .choices
@@ -3593,6 +3958,106 @@ mod controller_tests {
         });
 
         Ok(LlamaCppController::parse_query_plan(&value.to_string())?)
+    }
+
+    #[test]
+    fn pending_reminder_edit_accepts_natural_title_and_reordered_time() {
+        let parsed = LlamaCppController::parse_task_reminder_pending_mutation(
+            "Edit the Google Calendar edit bug reminder to 19:00 tomorrow.",
+        );
+
+        assert_eq!(
+            parsed,
+            Some((
+                "reminders.list",
+                "update",
+                "Google Calendar edit bug".to_string(),
+                Some("tomorrow at 19:00".to_string()),
+            ))
+        );
+    }
+
+    #[test]
+    fn clarification_response_resolves_exact_reminder_title() {
+        let context = ControllerContext {
+            request: UserRequest {
+                text: "test Google Calendar edit bug".to_string(),
+            },
+            history: r#"USER:
+Edit the Google Calendar edit bug reminder to 19:00 tomorrow.
+
+ASSISTANT:
+I found multiple active reminder matches for 'Google Calendar edit bug'. Which one should I change?"#
+                .to_string(),
+            observations: Vec::new(),
+        };
+
+        let plan = LlamaCppController::deterministic_task_reminder_plan(&context)
+            .expect("clarification response should resolve deterministically");
+
+        assert_eq!(
+            plan.intent,
+            QueryIntent::CallTool {
+                tool: "reminders.list".to_string(),
+                arguments: serde_json::json!({
+                    "query": "test Google Calendar edit bug",
+                    "limit": 20
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn clarification_response_mutates_the_selected_reminder() {
+        let context = ControllerContext {
+            request: UserRequest {
+                text: "test Google Calendar edit bug".to_string(),
+            },
+            history: r#"USER:
+Edit the Google Calendar edit bug reminder to 19:00 tomorrow.
+
+ASSISTANT:
+I found multiple active reminder matches for 'Google Calendar edit bug'. Which one should I change?"#
+                .to_string(),
+            observations: vec![OrchestrationTrace {
+                step: 0,
+                action: ControllerAction::CallTool {
+                    tool: "reminders.list".to_string(),
+                    arguments: serde_json::json!({
+                        "query": "test Google Calendar edit bug",
+                        "limit": 20
+                    }),
+                },
+                result: ActionResult::Tool {
+                    result: ToolResult {
+                        success: true,
+                        output: serde_json::json!({
+                            "items": [
+                                {
+                                    "id": "reminder:test-1",
+                                    "title": "test Google Calendar edit bug"
+                                }
+                            ]
+                        }),
+                    },
+                },
+            }],
+        };
+
+        let plan = LlamaCppController::deterministic_task_reminder_plan(&context)
+            .expect("clarification response should produce a mutation plan");
+
+        assert_eq!(
+            plan.intent,
+            QueryIntent::CallTool {
+                tool: "reminders.mutate".to_string(),
+                arguments: serde_json::json!({
+                    "operation": "update",
+                    "id": "reminder:test-1",
+                    "due": "tomorrow at 19:00"
+                }),
+            }
+        );
     }
 
     #[test]
@@ -4266,6 +4731,8 @@ Reminder created: 'test Chat approval' scheduled for today at 15:00."#
         assert!(user_content.contains("CONVERSATION HISTORY:\nUSER:\nPrevious question."));
         assert!(user_content.contains("EXECUTION TRACE:"));
         assert!(user_content.contains("\"chunk-1\""));
+        assert!(!user_content.contains("OUTPUT SCHEMA:"));
+        assert!(user_content.chars().count() <= MAX_CONTROLLER_USER_CONTENT_CHARS);
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
         assert!(
@@ -4310,13 +4777,7 @@ Reminder created: 'test Chat approval' scheduled for today at 15:00."#
         assert!(user_content.contains("CURRENT USER REQUEST:"));
         assert!(user_content.contains("CONVERSATION HISTORY:"));
         assert!(user_content.contains("EXECUTION TRACE:"));
-        assert!(
-            user_content.chars().count()
-                <= MAX_CONTROLLER_REQUEST_CHARS
-                    + MAX_CONTROLLER_HISTORY_CHARS
-                    + MAX_CONTROLLER_TRACE_CHARS
-                    + 100
-        );
+        assert!(user_content.chars().count() <= MAX_CONTROLLER_USER_CONTENT_CHARS);
 
         Ok(())
     }
@@ -4331,6 +4792,74 @@ Reminder created: 'test Chat approval' scheduled for today at 15:00."#
             normalize_memory_subject(Some("QWEN 3.5".to_string())),
             Some("QWEN 3.5".to_string())
         );
+    }
+
+    #[test]
+    fn deterministic_personal_memory_queries_search_persistent_memory() {
+        let context = ControllerContext {
+            request: UserRequest {
+                text: "Who am I?".to_string(),
+            },
+            history: String::new(),
+            observations: Vec::new(),
+        };
+
+        let plan = LlamaCppController::deterministic_personal_memory_plan(&context)
+            .expect("identity query should deterministically search memory");
+
+        assert!(matches!(
+            plan.intent,
+            QueryIntent::RetrieveMemory {
+                query,
+                limit: 5,
+                subject: None,
+                time: None,
+                mode: MemoryIntentMode::Unspecified,
+            } if query == "name"
+        ));
+    }
+
+    #[test]
+    fn personal_memory_match_can_proceed_without_graph_support() {
+        let query = MemoryQuery {
+            query: "favourite project".to_string(),
+            limit: 5,
+            subject: None,
+            time: None,
+            mode: MemoryIntentMode::Unspecified,
+        };
+
+        let make_result = |id: &str, text: &str| MemoryResult {
+            id: id.to_string(),
+            text: text.to_string(),
+            score: 0.01,
+            score_breakdown: Some(MemoryScoreBreakdown {
+                lexical_rrf: 1.0 / 61.0,
+                semantic_rrf: 0.0,
+                rrf_score: 1.0 / 61.0,
+                graph_strength: 0.0,
+                graph_bonus: 0.0,
+                temporal_state_bonus: 0.0,
+                final_score: 1.0 / 61.0,
+            }),
+            graph: Some(MemoryGraphContext {
+                note_id: id.to_string(),
+                path: format!("journal/{id}.md"),
+                entities: Vec::new(),
+                relationships: Vec::new(),
+                events: Vec::new(),
+                states: Vec::new(),
+                related_notes: Vec::new(),
+            }),
+        };
+
+        let results = vec![make_result(
+            "note-favourite-project",
+            "Zaraki is the user's favourite project.",
+        )];
+
+        let (decision, _) = assess_memory_query(&query, &results);
+        assert_eq!(decision, MemoryEvidenceDecision::Proceed);
     }
 
     #[test]

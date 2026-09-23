@@ -41,6 +41,16 @@ impl BackgroundWorkers {
         qwen_url: impl Into<String>,
         qwen_model: Arc<RwLock<String>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_with_shared_model_and_indexer(memory_root, db_path, qwen_url, qwen_model, None)
+    }
+
+    pub fn start_with_shared_model_and_indexer(
+        memory_root: impl AsRef<Path>,
+        db_path: impl AsRef<Path>,
+        qwen_url: impl Into<String>,
+        qwen_model: Arc<RwLock<String>>,
+        memory_indexer: Option<orchestrator::PersistentMemoryIndexer>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let memory_root = memory_root.as_ref().to_path_buf();
         let db_path = db_path.as_ref().to_path_buf();
         std::fs::create_dir_all(&memory_root)?;
@@ -59,6 +69,7 @@ impl BackgroundWorkers {
                 let db_path = db_path.clone();
                 let qwen_url = qwen_url.clone();
                 let qwen_model = Arc::clone(&qwen_model);
+                let memory_indexer = memory_indexer.clone();
                 move || {
                     let db = match SqliteMemoryDb::open(&db_path) {
                         Ok(db) => db,
@@ -75,6 +86,11 @@ impl BackgroundWorkers {
                         db,
                         ModelRouter::new_with_shared_qwen_model(qwen_url, qwen_model),
                     );
+                    let worker = if let Some(indexer) = memory_indexer {
+                        worker.with_auto_apply_indexer(indexer)
+                    } else {
+                        worker
+                    };
                     while !stop.load(Ordering::Relaxed) {
                         if let Err(error) = worker.run_once() {
                             eprintln!("Memory extraction worker: {error}");

@@ -60,6 +60,7 @@ struct ExtractionItem {
 pub struct MemoryExtractionWorker<M> {
     db: SqliteMemoryDb,
     models: M,
+    auto_apply_indexer: Option<orchestrator::PersistentMemoryIndexer>,
 }
 
 impl<M> MemoryExtractionWorker<M>
@@ -67,7 +68,19 @@ where
     M: ModelExecutor,
 {
     pub fn new(db: SqliteMemoryDb, models: M) -> Self {
-        Self { db, models }
+        Self {
+            db,
+            models,
+            auto_apply_indexer: None,
+        }
+    }
+
+    pub fn with_auto_apply_indexer(
+        mut self,
+        indexer: orchestrator::PersistentMemoryIndexer,
+    ) -> Self {
+        self.auto_apply_indexer = Some(indexer);
+        self
     }
 
     pub fn run_once(&self) -> Result<()> {
@@ -107,11 +120,15 @@ where
     }
 
     fn process_turn(&self, turn_id: i64) -> Result<()> {
-        if self
+        if let Some(existing) = self
             .db
             .latest_memory_extraction_proposal_for_turn(turn_id)?
-            .is_some()
         {
+            if existing.decision == "must_save" && existing.status == "pending" {
+                if let Some(indexer) = &self.auto_apply_indexer {
+                    indexer.apply_memory_extraction_proposal(&existing.id)?;
+                }
+            }
             return Ok(());
         }
 
@@ -134,11 +151,21 @@ where
             enforce_save_policy(parse_extraction_output(&output.output)?, &turn.user_text);
         let payload_json = serde_json::to_string(&proposal)?;
 
-        self.db.store_memory_extraction_proposal(
+        let proposal_id = self.db.store_memory_extraction_proposal(
             turn_id,
             decision_name(proposal.decision),
             &payload_json,
         )?;
+
+        if matches!(
+            proposal.decision,
+            ExtractionDecision::MustSave | ExtractionDecision::ShouldSave
+        ) {
+            if let Some(indexer) = &self.auto_apply_indexer {
+                indexer.apply_memory_extraction_proposal(&proposal_id)?;
+            }
+        }
+
         Ok(())
     }
 }
@@ -550,47 +577,22 @@ fn parse_extraction_output(output: &str) -> Result<ExtractionProposal> {
 }
 
 fn enforce_save_policy(mut proposal: ExtractionProposal, user_text: &str) -> ExtractionProposal {
-    if proposal.decision == ExtractionDecision::MustSave && !is_explicit_save_request(user_text) {
-        proposal.decision = ExtractionDecision::ShouldSave;
+    let explicit_save = orchestrator::is_explicit_memory_write_request(user_text);
+
+    match proposal.decision {
+        ExtractionDecision::MustSave if !explicit_save => {
+            proposal.decision = ExtractionDecision::ShouldSave;
+        }
+        ExtractionDecision::ShouldSave if explicit_save => {
+            proposal.decision = ExtractionDecision::MustSave;
+        }
+        _ => {}
     }
+
     if proposal.decision == ExtractionDecision::DontSave {
         proposal.items.clear();
     }
     proposal
-}
-
-fn is_explicit_save_request(text: &str) -> bool {
-    let normalized = text.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return false;
-    }
-    [
-        "remember that ",
-        "remember this",
-        "please remember that ",
-        "please remember this",
-        "save this",
-        "save that",
-        "save the fact",
-        "store this",
-        "store that",
-        "store the fact",
-        "write this to memory",
-        "write that to memory",
-        "add this to memory",
-        "add that to memory",
-        "make a note of ",
-        "memorize this",
-        "memorise this",
-        "please save this to memory",
-        "please save that to memory",
-        "save this to memory",
-        "save that to memory",
-        "write memory",
-        "save memory",
-    ]
-    .iter()
-    .any(|prefix| normalized.starts_with(prefix))
 }
 
 fn decision_name(decision: ExtractionDecision) -> &'static str {
@@ -626,7 +628,12 @@ fn truncate_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::Mutex,
+        thread,
+    };
 
     struct FakeModel {
         output: String,
@@ -648,6 +655,34 @@ mod tests {
         let db = SqliteMemoryDb::open(directory.path().join("worker.db"))?;
         db.initialize_schema()?;
         Ok((directory, db))
+    }
+
+    fn start_embedding_server() -> Result<(String, thread::JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("embedding mock server accept failed");
+            let mut request = [0u8; 8192];
+            let _ = stream
+                .read(&mut request)
+                .expect("embedding mock server read failed");
+            let embedding = vec![0.0f32; 384];
+            let body = serde_json::json!({
+                "data": [{"embedding": embedding}]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("embedding mock server write failed");
+        });
+        Ok((format!("http://{}", address), handle))
     }
 
     #[test]
@@ -772,11 +807,31 @@ mod tests {
     }
 
     #[test]
+    fn explicit_save_upgrades_should_save_to_must_save() -> Result<()> {
+        let output = r#"{"decision":"should_save","items":[{"kind":"fact","title":"Fact","body":"Something durable.","tags":[],"entities":[],"relationships":[],"events":[],"states":[]}] }"#;
+        let proposal = parse_extraction_output(output)?;
+        assert_eq!(
+            enforce_save_policy(proposal.clone(), "My name is Pranav. Please save that.").decision,
+            ExtractionDecision::MustSave
+        );
+        assert_eq!(
+            enforce_save_policy(proposal, "Please remember this: Qwen is my model.").decision,
+            ExtractionDecision::MustSave
+        );
+        Ok(())
+    }
+
+    #[test]
     fn explicit_save_preserves_must_save() -> Result<()> {
         let output = r#"{"decision":"must_save","items":[{"kind":"fact","title":"Fact","body":"Something durable.","tags":[],"entities":[],"relationships":[],"events":[],"states":[]}] }"#;
         let proposal = parse_extraction_output(output)?;
         assert_eq!(
-            enforce_save_policy(proposal, "Please remember this: Qwen is my model.").decision,
+            enforce_save_policy(proposal.clone(), "Please remember this: Qwen is my model.")
+                .decision,
+            ExtractionDecision::MustSave
+        );
+        assert_eq!(
+            enforce_save_policy(proposal, "My name is Pranav. Please save that.").decision,
             ExtractionDecision::MustSave
         );
         Ok(())
@@ -815,6 +870,123 @@ mod tests {
                 .decision,
             "should_save"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn should_save_is_applied_automatically() -> Result<()> {
+        let (_directory, db) = test_db()?;
+        let database = _directory.path().join("worker.db");
+        let memory_root = _directory.path().join("memory");
+        std::fs::create_dir_all(&memory_root)?;
+
+        let turn_id = db.append_conversation_turn(
+            "session-1",
+            "My name is Pranav and I prefer Optimus Prime.",
+            "Understood.",
+        )?;
+        let job_id = db.enqueue_job(
+            EXTRACT_MEMORY_JOB,
+            Some(CONVERSATION_TARGET),
+            Some(&turn_id.to_string()),
+            0,
+            Some("2026-09-12T10:00:00Z"),
+        )?;
+
+        let (embedding_url, handle) = start_embedding_server()?;
+        let indexer = orchestrator::PersistentMemoryIndexer::new(
+            &database,
+            &memory_root,
+            embedding_url,
+            "test-embedding-model",
+        )?;
+        let model = FakeModel {
+            output: r#"{"decision":"should_save","items":[{"kind":"fact","title":"User name","body":"Pranav prefers to be called Optimus Prime.","tags":["identity"],"entities":[],"relationships":[],"events":[],"states":[],"task_status":null,"reminder_status":null,"due_at":null}]}"#.to_string(),
+            calls: Mutex::new(0),
+        };
+        let worker = MemoryExtractionWorker::new(db, model).with_auto_apply_indexer(indexer);
+
+        worker.run_once()?;
+
+        let job = worker.db.job(&job_id)?.ok_or("job missing")?;
+        assert_eq!(job.status, sqlite_memory::JobStatus::Completed);
+        let proposal = worker
+            .db
+            .latest_memory_extraction_proposal_for_turn(turn_id)?
+            .ok_or("proposal missing")?;
+        assert_eq!(proposal.decision, "should_save");
+        assert_eq!(proposal.status, "applied");
+
+        let extracted_dir = memory_root.join("journal/extracted");
+        let extracted_entries =
+            std::fs::read_dir(&extracted_dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(extracted_entries.len(), 1);
+
+        handle
+            .join()
+            .map_err(|_| "embedding mock server thread panicked")?;
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_must_save_is_applied_automatically() -> Result<()> {
+        let (_directory, db) = test_db()?;
+        let database = _directory.path().join("worker.db");
+        let memory_root = _directory.path().join("memory");
+        std::fs::create_dir_all(&memory_root)?;
+
+        let turn_id = db.append_conversation_turn(
+            "session-1",
+            "My name is Pranav. Please save that.",
+            "I saved it to persistent memory.",
+        )?;
+        let job_id = db.enqueue_job(
+            EXTRACT_MEMORY_JOB,
+            Some(CONVERSATION_TARGET),
+            Some(&turn_id.to_string()),
+            0,
+            Some("2026-09-12T10:00:00Z"),
+        )?;
+
+        let (embedding_url, handle) = start_embedding_server()?;
+        let indexer = orchestrator::PersistentMemoryIndexer::new(
+            &database,
+            &memory_root,
+            embedding_url,
+            "test-embedding-model",
+        )?;
+        let model = FakeModel {
+            output: r#"{"decision":"must_save","items":[{"kind":"fact","title":"User name","body":"Pranav is the user's name.","tags":[],"entities":[],"relationships":[],"events":[],"states":[],"task_status":null,"reminder_status":null,"due_at":null}]}"#.to_string(),
+            calls: Mutex::new(0),
+        };
+        let worker = MemoryExtractionWorker::new(db, model).with_auto_apply_indexer(indexer);
+
+        worker.run_once()?;
+
+        let job = worker.db.job(&job_id)?.ok_or("job missing")?;
+        assert_eq!(job.status, sqlite_memory::JobStatus::Completed);
+        let proposal = worker
+            .db
+            .latest_memory_extraction_proposal_for_turn(turn_id)?
+            .ok_or("proposal missing")?;
+        assert_eq!(proposal.decision, "must_save");
+        assert_eq!(proposal.status, "applied");
+
+        let extracted_dir = memory_root.join("journal/extracted");
+        let extracted_entries =
+            std::fs::read_dir(&extracted_dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(extracted_entries.len(), 1);
+        assert!(
+            extracted_entries[0]
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("md")
+        );
+
+        handle
+            .join()
+            .map_err(|_| "embedding mock server thread panicked")?;
         Ok(())
     }
 

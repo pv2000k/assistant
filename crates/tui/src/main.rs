@@ -4064,6 +4064,42 @@ fn modal_title(modal: Modal) -> &'static str {
     }
 }
 
+fn approval_title(
+    approval: &ApprovalRequestSummary,
+    tasks: &[UiTask],
+    reminders: &[UiReminder],
+) -> Option<String> {
+    if !matches!(approval.tool.as_str(), "tasks.mutate" | "reminders.mutate") {
+        return None;
+    }
+
+    if let Some(title) = approval
+        .arguments
+        .get("title")
+        .and_then(|value| value.as_str())
+    {
+        if !title.trim().is_empty() {
+            return Some(title.to_string());
+        }
+    }
+
+    let id = approval
+        .arguments
+        .get("id")
+        .and_then(|value| value.as_str())?;
+    match approval.tool.as_str() {
+        "tasks.mutate" => tasks
+            .iter()
+            .find(|task| task.id == id)
+            .map(|task| task.title.clone()),
+        "reminders.mutate" => reminders
+            .iter()
+            .find(|reminder| reminder.id == id)
+            .map(|reminder| reminder.title.clone()),
+        _ => None,
+    }
+}
+
 fn modal_lines(app: &App, modal: Modal, width: usize) -> Vec<Line<'static>> {
     match modal {
         Modal::Help => vec![
@@ -4117,7 +4153,11 @@ fn modal_lines(app: &App, modal: Modal, width: usize) -> Vec<Line<'static>> {
 
             let arguments = serde_json::to_string_pretty(&approval.arguments)
                 .unwrap_or_else(|_| approval.arguments.to_string());
-            let mut lines = vec![format!("Tool: {}", approval.tool), "Arguments:".to_string()];
+            let mut lines = vec![format!("Tool: {}", approval.tool)];
+            if let Some(title) = approval_title(approval, &app.tasks, &app.reminders) {
+                lines.push(format!("Title: {title}"));
+            }
+            lines.push("Arguments:".to_string());
             lines.extend(arguments.lines().map(str::to_string));
             detail_lines(lines, width, "Enter/Y approve | N/Esc deny")
         }
@@ -6095,6 +6135,52 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_title_resolves_existing_reminder_by_id() {
+        let reminder = UiReminder {
+            id: "reminder:test".to_string(),
+            title: "Google Calendar edit bug".to_string(),
+            body: String::new(),
+            status: "scheduled".to_string(),
+            due_at: Some("24-09-26 19:00".to_string()),
+            created_at: String::new(),
+            updated_at: String::new(),
+            calendar_sync_enabled: true,
+            calendar_sync_status: Some("synced".to_string()),
+        };
+        let approval = ApprovalRequestSummary {
+            id: 1,
+            tool: "reminders.mutate".to_string(),
+            arguments: serde_json::json!({
+                "operation": "update",
+                "id": "reminder:test",
+                "due": "tomorrow at 19:00"
+            }),
+        };
+
+        assert_eq!(
+            approval_title(&approval, &[], &[reminder]),
+            Some("Google Calendar edit bug".to_string())
+        );
+    }
+
+    #[test]
+    fn approval_title_uses_mutation_title_argument() {
+        let approval = ApprovalRequestSummary {
+            id: 2,
+            tool: "reminders.mutate".to_string(),
+            arguments: serde_json::json!({
+                "operation": "create",
+                "title": "Review Google Calendar sync"
+            }),
+        };
+
+        assert_eq!(
+            approval_title(&approval, &[], &[]),
+            Some("Review Google Calendar sync".to_string())
+        );
+    }
 
     #[test]
     fn mini_task_line_stays_compact() {
